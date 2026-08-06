@@ -4,9 +4,9 @@
   <name>composite_sensing</name>
   <version>0.0.0</version>
   <description>
-    Composite sensing: stereo camera device + derived VSLAM (cuVSLAM).
-    Future home for mesh ICP / lidar composite nodes that publish both raw
-    and derived data.
+    Composite sensing: stereo+cuVSLAM and lidar+mesh-PF composites.
+    Lidar path owns vendor SDK in-process and runs a constant-twist mesh
+    particle filter (Embree) as a map-absolute pose source for the EKF.
   </description>
   <maintainer email="hound@todo.todo">hound</maintainer>
   <license>Apache-2.0</license>
@@ -20,7 +20,9 @@
   <depend>nav_msgs</depend>
   <depend>tf2</depend>
   <depend>tf2_ros</depend>
+  <depend>std_srvs</depend>
   <depend>librealsense2</depend>
+  <build_depend>assimp</build_depend>
 
   <exec_depend>rclpy</exec_depend>
 
