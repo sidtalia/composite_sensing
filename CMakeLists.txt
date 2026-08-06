@@ -159,6 +159,7 @@ ament_python_install_package(${PROJECT_NAME}
 install(PROGRAMS
   scripts/stereo_composite_stereo
   scripts/install_deps.sh
+  scripts/multicam_rail_replay
   DESTINATION lib/${PROJECT_NAME}
 )
 
