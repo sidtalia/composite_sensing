@@ -13,9 +13,12 @@ find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
+find_package(tf2_eigen REQUIRED)
+find_package(Eigen3 REQUIRED)
 find_package(realsense2 REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(assimp REQUIRED)
+find_package(OpenCV REQUIRED COMPONENTS core imgcodecs imgproc)
 
 include_directories(include)
 
@@ -32,6 +35,23 @@ else()
   set(UNITREE_SDK_LIB_DIR "${UNITREE_SDK_ROOT}/lib/x86_64")
 endif()
 set(UNITREE_SDK_LIB "${UNITREE_SDK_LIB_DIR}/libunitree_lidar_sdk.a")
+
+# Livox-SDK2 (Mid-360 / Mid-360S). Built separately under ../Livox-SDK2/build.
+set(LIVOX_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../Livox-SDK2")
+set(LIVOX_SDK_INCLUDE "${LIVOX_SDK_ROOT}/include")
+set(LIVOX_SDK_LIB "${LIVOX_SDK_ROOT}/build/sdk_core/liblivox_lidar_sdk_static.a")
+if(NOT EXISTS "${LIVOX_SDK_LIB}")
+  set(LIVOX_SDK_LIB "${LIVOX_SDK_ROOT}/build/sdk_core/liblivox_lidar_sdk_shared.so")
+endif()
+if(EXISTS "${LIVOX_SDK_LIB}" AND EXISTS "${LIVOX_SDK_INCLUDE}/livox_lidar_api.h")
+  set(HAVE_LIVOX_SDK ON)
+  message(STATUS "Livox-SDK2: ${LIVOX_SDK_LIB}")
+else()
+  set(HAVE_LIVOX_SDK OFF)
+  message(WARNING
+    "Livox-SDK2 not found (expected ${LIVOX_SDK_ROOT}/build/sdk_core/liblivox*). "
+    "Build Livox-SDK2 first; livox backend will fail to link.")
+endif()
 
 # Prefer official NVIDIA cuVSLAM SDK under /opt/cuvslam; fall back to Isaac ROS.
 if(DEFINED ENV{CUVSLAM_INCLUDE_DIR} AND DEFINED ENV{CUVSLAM_LIB})
@@ -78,12 +98,14 @@ add_executable(stereo_composite_modular_node
   src/stereo_composite_modular_main.cpp
   src/stereo_composite_modular_node.cpp
   src/realsense_camera_device.cpp
+  src/dataset_camera_device.cpp
   src/cuvslam_backend.cpp
 )
 target_include_directories(stereo_composite_modular_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   ${CUVSLAM_INCLUDE_DIR}
   ${realsense2_INCLUDE_DIR}
+  ${OpenCV_INCLUDE_DIRS}
 )
 ament_target_dependencies(stereo_composite_modular_node
   rclcpp
@@ -96,45 +118,86 @@ ament_target_dependencies(stereo_composite_modular_node
 target_link_libraries(stereo_composite_modular_node
   ${realsense2_LIBRARY}
   ${CUVSLAM_LIB}
+  ${OpenCV_LIBS}
 )
 target_compile_features(stereo_composite_modular_node PUBLIC cxx_std_17)
 
-# --- Lidar + constant-twist mesh PF composite ---------------------------------
+# --- Lidar composite (SDK + static TF + in-process deskew) --------------------
 set(BUILD_LIDAR_MESH_COMPOSITE OFF)
-if(EMBREE_LIB AND EMBREE_INCLUDE_DIR AND EXISTS "${UNITREE_SDK_LIB}")
+if(EXISTS "${UNITREE_SDK_LIB}")
   set(BUILD_LIDAR_MESH_COMPOSITE ON)
-  message(STATUS "lidar_mesh_composite: embree=${EMBREE_LIB} unitree=${UNITREE_SDK_LIB}")
-  add_executable(lidar_mesh_composite_node
+  message(STATUS "lidar_mesh_composite: unitree=${UNITREE_SDK_LIB}")
+  set(LIDAR_MESH_SRCS
     src/lidar_mesh_composite_main.cpp
     src/lidar_mesh_composite_node.cpp
+    src/cloud_deskew.cpp
     src/unilidar_lidar_device.cpp
-    src/constant_twist_mesh_pf_backend.cpp
-    src/embree_mesh_map.cpp
   )
+  if(HAVE_LIVOX_SDK)
+    list(APPEND LIDAR_MESH_SRCS src/livox_lidar_device.cpp)
+  endif()
+  add_executable(lidar_mesh_composite_node ${LIDAR_MESH_SRCS})
   target_include_directories(lidar_mesh_composite_node PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    ${EMBREE_INCLUDE_DIR}
     ${UNITREE_SDK_ROOT}/include
   )
+  if(HAVE_LIVOX_SDK)
+    target_include_directories(lidar_mesh_composite_node PUBLIC ${LIVOX_SDK_INCLUDE})
+    target_compile_definitions(lidar_mesh_composite_node PUBLIC HOUND_HAVE_LIVOX_SDK=1)
+  endif()
   ament_target_dependencies(lidar_mesh_composite_node
     rclcpp
     sensor_msgs
     geometry_msgs
-    nav_msgs
     tf2
     tf2_ros
-    std_srvs
+    tf2_eigen
   )
   target_link_libraries(lidar_mesh_composite_node
-    ${EMBREE_LIB}
     ${UNITREE_SDK_LIB}
-    assimp::assimp
+    Eigen3::Eigen
   )
+  if(HAVE_LIVOX_SDK)
+    target_link_libraries(lidar_mesh_composite_node ${LIVOX_SDK_LIB} pthread)
+  endif()
   target_compile_features(lidar_mesh_composite_node PUBLIC cxx_std_17)
 else()
   message(WARNING
-    "lidar_mesh_composite DISABLED (need libembree-dev, unilidar_sdk static lib). "
-    "embree_lib=${EMBREE_LIB} embree_inc=${EMBREE_INCLUDE_DIR} unitree=${UNITREE_SDK_LIB}")
+    "lidar_mesh_composite DISABLED (need unilidar_sdk static lib). "
+    "unitree=${UNITREE_SDK_LIB}")
+endif()
+
+# --- Standalone Embree mesh PF ------------------------------------------------
+set(BUILD_MESH_PF OFF)
+if(EMBREE_LIB AND EMBREE_INCLUDE_DIR)
+  set(BUILD_MESH_PF ON)
+  message(STATUS "mesh_pf: embree=${EMBREE_LIB}")
+  add_executable(mesh_pf_node
+    src/mesh_pf_main.cpp
+    src/mesh_pf_node.cpp
+    src/constant_twist_mesh_pf_backend.cpp
+    src/embree_mesh_map.cpp
+  )
+  target_include_directories(mesh_pf_node PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    ${EMBREE_INCLUDE_DIR}
+  )
+  ament_target_dependencies(mesh_pf_node
+    rclcpp
+    sensor_msgs
+    geometry_msgs
+    std_srvs
+    tf2
+  )
+  target_link_libraries(mesh_pf_node
+    ${EMBREE_LIB}
+    assimp::assimp
+  )
+  target_compile_features(mesh_pf_node PUBLIC cxx_std_17)
+else()
+  message(WARNING
+    "mesh_pf DISABLED (need libembree-dev). "
+    "embree_lib=${EMBREE_LIB} embree_inc=${EMBREE_INCLUDE_DIR}")
 endif()
 
 install(TARGETS
@@ -144,6 +207,11 @@ install(TARGETS
 )
 if(BUILD_LIDAR_MESH_COMPOSITE)
   install(TARGETS lidar_mesh_composite_node
+    DESTINATION lib/${PROJECT_NAME}
+  )
+endif()
+if(BUILD_MESH_PF)
+  install(TARGETS mesh_pf_node
     DESTINATION lib/${PROJECT_NAME}
   )
 endif()

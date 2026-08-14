@@ -19,6 +19,7 @@
 #include <tf2_ros/transform_broadcaster.h>
 
 #include "composite_sensing/camera_device.hpp"
+#include "composite_sensing/dataset_camera_device.hpp"
 #include "composite_sensing/realsense_camera_device.hpp"
 #include "composite_sensing/vslam_backend.hpp"
 
@@ -46,6 +47,8 @@ private:
     uint64_t pose_seq{0};
     rclcpp::Time ros_stamp{0, 0, RCL_ROS_TIME};
     PoseOptical pose{};
+    bool has_gt{false};
+    PoseOptical gt_pose{};
 
     bool has_color{false};
     uint64_t color_seq{0};
@@ -64,10 +67,25 @@ private:
   void color_worker();
   void depth_worker();
   void publish_odom_tf(const rclcpp::Time & stamp, const PoseOptical & pose);
+  void publish_gt_odom(const rclcpp::Time & stamp, const PoseOptical & pose);
 
   // Params (startup-only) — names match legacy realsense_cuvslam_node
   std::string serial_number_;
   std::string camera_name_;
+  /** ``realsense`` (default) or ``dataset`` (DatasetCameraDevice). */
+  std::string camera_backend_{"realsense"};
+  std::string dataset_path_;
+  std::string dataset_view_{"front"};
+  bool dataset_loop_{true};
+  double dataset_rate_hz_{30.0};
+  /** When false, skip cuVSLAM and use dataset GT poses if available. */
+  bool enable_vslam_{true};
+  /**
+   * Pose published on odom/TF: ``vslam`` (default) or ``gt`` (dataset).
+   * With ``gt``, cuVSLAM still runs when enable_vslam (compute load) but
+   * mapping consumers see ground-truth TF.
+   */
+  std::string odom_source_{"vslam"};
   int infra_width_{640};
   int infra_height_{360};
   int infra_fps_{60};
@@ -85,9 +103,15 @@ private:
   int emitter_enabled_{0};
   int visual_preset_{3};
   double clip_distance_{0.0};
+  bool initial_reset_{false};
   std::string odom_topic_;
   std::string odom_frame_;
   std::string base_frame_;
+  /** When false (default), odom is a measurement only — EKF owns odom→base TF. */
+  bool publish_odom_tf_{false};
+  bool apply_body_mount_{false};
+  std::array<double, 3> t_body_sensor_{{0, 0, 0}};
+  std::array<double, 9> R_body_sensor_{{1, 0, 0, 0, 1, 0, 0, 0, 1}};
   bool async_sba_{true};
   bool slam_sync_mode_{false};
   int warmup_frames_{60};
@@ -96,6 +120,8 @@ private:
   bool profile_{false};
 
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
+  /** Dataset GT optical→FLU odom, same stamp as est when available. */
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr gt_odom_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr color_pub_;
   rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr color_info_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr depth_pub_;
@@ -108,7 +134,8 @@ private:
   std::string color_optical_frame_;
   std::string depth_optical_frame_;
 
-  std::unique_ptr<RealsenseCameraDevice> camera_;
+  std::unique_ptr<CameraDevice> camera_;
+  DatasetCameraDevice * dataset_camera_{nullptr};  // non-owning, when backend=dataset
   std::unique_ptr<VslamBackend> vslam_;
 
   LatestSlot slot_;

@@ -7,9 +7,12 @@
 
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <tf2/LinearMath/Quaternion.h>
+#include <tf2/time.h>
 
-#include "composite_sensing/constant_twist_mesh_pf_backend.hpp"
 #include "composite_sensing/unilidar_lidar_device.hpp"
+#if defined(HOUND_HAVE_LIVOX_SDK) && HOUND_HAVE_LIVOX_SDK
+#include "composite_sensing/livox_lidar_device.hpp"
+#endif
 
 namespace composite_sensing
 {
@@ -30,6 +33,14 @@ void rpy_deg_to_quat(
   qy = q.y();
   qz = q.z();
   qw = q.w();
+}
+
+DeskewReference parse_deskew_reference(const std::string & s)
+{
+  if (s == "start" || s == "Start" || s == "START") {
+    return DeskewReference::Start;
+  }
+  return DeskewReference::End;
 }
 
 }  // namespace
@@ -56,6 +67,12 @@ void LidarMeshCompositeNode::declare_params()
 {
   lidar_backend_ = declare_parameter<std::string>("lidar_backend", "unitree");
   port_ = declare_parameter<std::string>("port", "/dev/ttyUSB0");
+  lidar_ip_ = declare_parameter<std::string>("lidar_ip", "");
+  local_ip_ = declare_parameter<std::string>("local_ip", "");
+  lidar_port_ = static_cast<uint16_t>(declare_parameter<int>("lidar_port", 0));
+  local_port_ = static_cast<uint16_t>(declare_parameter<int>("local_port", 0));
+  config_path_ = declare_parameter<std::string>("config_path", "");
+  frame_time_ms_ = declare_parameter<int>("frame_time_ms", 100);
   lidar_frame_ = declare_parameter<std::string>("lidar_frame", "unilidar_lidar");
   base_frame_ = declare_parameter<std::string>("base_frame", "base_link");
   parent_frame_ = declare_parameter<std::string>("parent_frame", "base_link");
@@ -68,7 +85,6 @@ void LidarMeshCompositeNode::declare_params()
     const double y = declare_parameter<double>("rpy.yaw", 0.0);
     rpy_deg_to_quat(r, p, y, q_x_, q_y_, q_z_, q_w_);
   }
-  // Allow explicit quaternion override
   if (declare_parameter<bool>("use_quat_extrinsic", false)) {
     q_x_ = declare_parameter<double>("quat.x", 0.0);
     q_y_ = declare_parameter<double>("quat.y", 0.0);
@@ -80,32 +96,58 @@ void LidarMeshCompositeNode::declare_params()
   cloud_scan_num_ = declare_parameter<int>("cloud_scan_num", 18);
   publish_cloud_ = declare_parameter<bool>("publish_cloud", true);
   cloud_topic_ = declare_parameter<std::string>("cloud_topic", "/unilidar/cloud");
+  publish_raw_cloud_ = declare_parameter<bool>("publish_raw_cloud", false);
+  raw_cloud_topic_ = declare_parameter<std::string>("raw_cloud_topic", "/livox/cloud_raw");
+  core_temp_topic_ = declare_parameter<std::string>(
+    "core_temp_topic", "/livox/core_temp");
+  environment_temp_topic_ = declare_parameter<std::string>(
+    "environment_temp_topic", "/livox/environment_temp");
+  temp_query_period_s_ = declare_parameter<double>("temp_query_period_s", 2.0);
+  core_temp_warn_c_ = declare_parameter<double>("core_temp_warn_c", 55.0);
+  cloud_stale_warn_s_ = declare_parameter<double>("cloud_stale_warn_s", 5.0);
+  status_log_period_s_ = declare_parameter<double>("status_log_period_s", 60.0);
 
-  map_file_ = declare_parameter<std::string>("map_file", "");
-  map_frame_ = declare_parameter<std::string>("map_frame", "map");
-  pose_topic_ = declare_parameter<std::string>(
-    "pose_topic", "/localization/mesh_pose");
-  localize_hz_ = declare_parameter<double>("localize_hz", 10.0);
-  num_particles_ = declare_parameter<int>("num_particles", 2000);
-  beam_samples_ = declare_parameter<int>("beam_samples", 64);
-  global_init_on_start_ = declare_parameter<bool>("global_init_on_start", true);
-  init_bb_ = {
-    declare_parameter<double>("init_bb.xmin", -20.0),
-    declare_parameter<double>("init_bb.ymin", -20.0),
-    declare_parameter<double>("init_bb.zmin", 0.0),
-    declare_parameter<double>("init_bb.xmax", 20.0),
-    declare_parameter<double>("init_bb.ymax", 20.0),
-    declare_parameter<double>("init_bb.zmax", 2.0)};
+  deskew_enable_ = declare_parameter<bool>("deskew.enable", true);
+  deskew_motion_frame_ = declare_parameter<std::string>("deskew.motion_frame", "odom");
+  // Legacy alias: target_frame used to mean motion parent (and wrongly output frame).
+  {
+    const std::string legacy = declare_parameter<std::string>(
+      "deskew.target_frame", "");
+    if (!legacy.empty() && legacy != lidar_frame_) {
+      deskew_motion_frame_ = legacy;
+      RCLCPP_WARN(
+        get_logger(),
+        "deskew.target_frame is deprecated; use deskew.motion_frame (got %s)",
+        legacy.c_str());
+    }
+  }
+  deskew_reference_ = parse_deskew_reference(
+    declare_parameter<std::string>("deskew.reference", "end"));
+  // 0 = fail-fast (no wait); waiting was inflating deskew wall time to ~timeout.
+  deskew_tf_timeout_s_ = declare_parameter<double>("deskew.tf_lookup_timeout_s", 0.0);
+  deskew_warn_ms_ = declare_parameter<double>("deskew.warn_ms", 40.0);
+  deskew_tf_buffer_s_ = declare_parameter<double>("deskew.tf_buffer_duration_s", 10.0);
 }
 
 void LidarMeshCompositeNode::start_pipeline()
 {
   if (lidar_backend_ == "unitree") {
     lidar_ = std::make_unique<UnilidarLidarDevice>();
-  } else if (lidar_backend_ == "ouster" || lidar_backend_ == "livox") {
+  } else if (lidar_backend_ == "livox") {
+#if defined(HOUND_HAVE_LIVOX_SDK) && HOUND_HAVE_LIVOX_SDK
+    auto livox = std::make_unique<LivoxLidarDevice>();
+    if (!config_path_.empty()) {
+      livox->set_config_path(config_path_);
+    }
+    livox->set_frame_time_ms(frame_time_ms_);
+    lidar_ = std::move(livox);
+#else
     throw std::runtime_error(
-      "lidar_backend=" + lidar_backend_ +
-      " adapter not implemented yet (unitree works)");
+      "lidar_backend=livox but composite_sensing was built without Livox-SDK2");
+#endif
+  } else if (lidar_backend_ == "ouster") {
+    throw std::runtime_error(
+      "lidar_backend=ouster adapter not implemented yet");
   } else {
     throw std::runtime_error("Unknown lidar_backend: " + lidar_backend_);
   }
@@ -117,28 +159,18 @@ void LidarMeshCompositeNode::start_pipeline()
   lcfg.range_min = range_min_;
   lcfg.range_max = range_max_;
   lcfg.frame_id = lidar_frame_;
+  lcfg.lidar_ip = lidar_ip_;
+  lcfg.local_ip = local_ip_;
+  lcfg.lidar_port = lidar_port_;
+  lcfg.local_port = local_port_;
+  lcfg.config_path = config_path_;
+  lcfg.frame_time_ms = frame_time_ms_;
+  lcfg.temp_query_period_s = temp_query_period_s_;
   lidar_->open(lcfg);
 
-  auto pf = std::make_unique<ConstantTwistMeshPfBackend>();
-  MeshLocalizerConfig mcfg;
-  mcfg.map_file = map_file_;
-  mcfg.map_frame = map_frame_;
-  mcfg.base_frame = base_frame_;
-  mcfg.t_base_lidar = {t_x_, t_y_, t_z_};
-  mcfg.q_base_lidar = {q_x_, q_y_, q_z_, q_w_};
-  mcfg.num_particles = num_particles_;
-  mcfg.beam_samples = beam_samples_;
-  mcfg.localize_hz = localize_hz_;
-  mcfg.global_init_on_start = global_init_on_start_;
-  mcfg.init_bb = init_bb_;
-  if (!map_file_.empty()) {
-    pf->configure(mcfg);
-    localizer_ = std::move(pf);
-  } else {
-    RCLCPP_WARN(
-      get_logger(),
-      "map_file empty — lidar cloud only (mesh PF disabled)");
-  }
+  tf_buffer_ = std::make_shared<tf2_ros::Buffer>(
+    get_clock(), tf2::durationFromSec(deskew_tf_buffer_s_));
+  tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
   static_tf_ = std::make_unique<tf2_ros::StaticTransformBroadcaster>(this);
   publish_static_lidar_tf();
@@ -146,30 +178,32 @@ void LidarMeshCompositeNode::start_pipeline()
   if (publish_cloud_) {
     cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(cloud_topic_, 2);
   }
-  pose_pub_ = create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
-    pose_topic_, 10);
-
-  global_srv_ = create_service<std_srvs::srv::Empty>(
-    "~/global_localization",
-    [this](
-      const std::shared_ptr<std_srvs::srv::Empty::Request>,
-      std::shared_ptr<std_srvs::srv::Empty::Response>)
-    {
-      if (localizer_) {
-        localizer_->global_init();
-        RCLCPP_INFO(get_logger(), "mesh PF: global_init()");
-      }
-    });
+  if (publish_raw_cloud_) {
+    raw_cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+      raw_cloud_topic_, 2);
+  }
+  if (!core_temp_topic_.empty()) {
+    core_temp_pub_ = create_publisher<sensor_msgs::msg::Temperature>(
+      core_temp_topic_, 10);
+  }
+  if (!environment_temp_topic_.empty()) {
+    environment_temp_pub_ = create_publisher<sensor_msgs::msg::Temperature>(
+      environment_temp_topic_, 10);
+  }
 
   running_.store(true);
-  capture_thread_ = std::thread([this]() {capture_loop();});
+  capture_thread_ = std::thread([this]() { capture_loop(); });
 
   RCLCPP_INFO(
     get_logger(),
-    "lidar_mesh_composite up: backend=%s port=%s map=%s localize_hz=%.1f particles=%d",
-    lidar_backend_.c_str(), port_.c_str(),
-    map_file_.empty() ? "(none)" : map_file_.c_str(),
-    localize_hz_, num_particles_);
+    "lidar_mesh_composite up: backend=%s lidar_ip=%s cloud=%s deskew=%s "
+    "motion_frame=%s (output=%s)",
+    lidar_backend_.c_str(),
+    lidar_ip_.empty() ? "(n/a)" : lidar_ip_.c_str(),
+    cloud_topic_.c_str(),
+    deskew_enable_ ? "on" : "off",
+    deskew_motion_frame_.c_str(),
+    lidar_frame_.c_str());
 }
 
 void LidarMeshCompositeNode::publish_static_lidar_tf()
@@ -188,9 +222,11 @@ void LidarMeshCompositeNode::publish_static_lidar_tf()
   static_tf_->sendTransform(tf);
 }
 
-void LidarMeshCompositeNode::publish_cloud(const LidarFrame & cloud)
+void LidarMeshCompositeNode::publish_cloud(
+  const LidarFrame & cloud,
+  const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr & pub)
 {
-  if (!cloud_pub_) {
+  if (!pub) {
     return;
   }
   sensor_msgs::msg::PointCloud2 msg;
@@ -201,76 +237,178 @@ void LidarMeshCompositeNode::publish_cloud(const LidarFrame & cloud)
   msg.is_dense = false;
   msg.is_bigendian = false;
   sensor_msgs::PointCloud2Modifier mod(msg);
-  mod.setPointCloud2FieldsByString(2, "xyz", "intensity");
+  // "time" = seconds relative to header stamp (scan start). Kept for debug /
+  // legacy consumers; with in-process deskew, mapper MC should be off.
+  mod.setPointCloud2Fields(
+    5,
+    "x", 1, sensor_msgs::msg::PointField::FLOAT32,
+    "y", 1, sensor_msgs::msg::PointField::FLOAT32,
+    "z", 1, sensor_msgs::msg::PointField::FLOAT32,
+    "intensity", 1, sensor_msgs::msg::PointField::FLOAT32,
+    "time", 1, sensor_msgs::msg::PointField::FLOAT32);
   sensor_msgs::PointCloud2Iterator<float> iter_x(msg, "x");
   sensor_msgs::PointCloud2Iterator<float> iter_y(msg, "y");
   sensor_msgs::PointCloud2Iterator<float> iter_z(msg, "z");
   sensor_msgs::PointCloud2Iterator<float> iter_i(msg, "intensity");
+  sensor_msgs::PointCloud2Iterator<float> iter_t(msg, "time");
   for (const auto & p : cloud.points) {
     *iter_x = p.x;
     *iter_y = p.y;
     *iter_z = p.z;
     *iter_i = p.intensity;
+    *iter_t = p.time_offset_s;
     ++iter_x;
     ++iter_y;
     ++iter_z;
     ++iter_i;
+    ++iter_t;
   }
-  cloud_pub_->publish(msg);
+  pub->publish(msg);
 }
 
-void LidarMeshCompositeNode::publish_pose(
-  const PoseMap & pose, const rclcpp::Time & stamp)
+void LidarMeshCompositeNode::publish_temperatures()
 {
-  geometry_msgs::msg::PoseWithCovarianceStamped msg;
-  msg.header.stamp = stamp;
-  msg.header.frame_id = map_frame_;
-  msg.pose.pose.position.x = pose.translation[0];
-  msg.pose.pose.position.y = pose.translation[1];
-  msg.pose.pose.position.z = pose.translation[2];
-  msg.pose.pose.orientation.x = pose.rotation[0];
-  msg.pose.pose.orientation.y = pose.rotation[1];
-  msg.pose.pose.orientation.z = pose.rotation[2];
-  msg.pose.pose.orientation.w = pose.rotation[3];
-  const double v = pose.position_stddev_m * pose.position_stddev_m;
-  for (int i = 0; i < 36; ++i) {
-    msg.pose.covariance[i] = 0.0;
+  if (!lidar_) {
+    return;
   }
-  msg.pose.covariance[0] = v;
-  msg.pose.covariance[7] = v;
-  msg.pose.covariance[14] = v;
-  msg.pose.covariance[35] = 0.25;  // yaw var (rad^2) conservative
-  pose_pub_->publish(msg);
+  lidar_->request_status_update();
+  const LidarDeviceStatus st = lidar_->get_status();
+  const auto stamp = now();
+
+  if (st.core_temp_valid && core_temp_pub_) {
+    sensor_msgs::msg::Temperature msg;
+    msg.header.stamp = stamp;
+    msg.header.frame_id = lidar_frame_;
+    msg.temperature = static_cast<double>(st.core_temp_c);
+    msg.variance = 0.0;
+    core_temp_pub_->publish(msg);
+
+    if (st.core_temp_c >= static_cast<float>(core_temp_warn_c_)) {
+      if (!core_temp_high_warned_) {
+        RCLCPP_WARN(
+          get_logger(),
+          "Livox core_temp high: %.1f C (warn >= %.1f C)",
+          st.core_temp_c, core_temp_warn_c_);
+        core_temp_high_warned_ = true;
+      } else {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 30000,
+          "Livox core_temp high: %.1f C (warn >= %.1f C)",
+          st.core_temp_c, core_temp_warn_c_);
+      }
+    } else if (core_temp_high_warned_) {
+      RCLCPP_INFO(
+        get_logger(),
+        "Livox core_temp recovered: %.1f C", st.core_temp_c);
+      core_temp_high_warned_ = false;
+    }
+  }
+  if (st.environment_temp_valid && environment_temp_pub_) {
+    sensor_msgs::msg::Temperature msg;
+    msg.header.stamp = stamp;
+    msg.header.frame_id = lidar_frame_;
+    msg.temperature = static_cast<double>(st.environment_temp_c);
+    msg.variance = 0.0;
+    environment_temp_pub_->publish(msg);
+  }
 }
 
 void LidarMeshCompositeNode::capture_loop()
 {
-  const auto min_period = std::chrono::duration<double>(
-    1.0 / std::max(1.0, localize_hz_));
+  last_status_log_ = std::chrono::steady_clock::now();
+  last_cloud_steady_ = last_status_log_;
+  bool saw_first_cloud = false;
+
   while (running_.load(std::memory_order_relaxed)) {
+    const auto now_tp = std::chrono::steady_clock::now();
+
     LidarFrame cloud;
     if (!lidar_->wait_cloud(cloud, 200)) {
-      continue;
-    }
-    if (publish_cloud_) {
-      publish_cloud(cloud);
-    }
-    if (!localizer_) {
-      continue;
+      publish_temperatures();
+      if (cloud_stale_warn_s_ > 0.0 &&
+          (now_tp - last_cloud_steady_) >=
+            std::chrono::duration<double>(cloud_stale_warn_s_))
+      {
+        if (!cloud_stale_warned_) {
+          RCLCPP_WARN(
+            get_logger(),
+            "no lidar cloud for >%.1f s (topic %s)%s",
+            cloud_stale_warn_s_, cloud_topic_.c_str(),
+            saw_first_cloud ? "" : " — never received first cloud");
+          cloud_stale_warned_ = true;
+        }
+      }
+    } else {
+      if (cloud_stale_warned_) {
+        RCLCPP_INFO(get_logger(), "lidar cloud resumed (%zu points)", cloud.points.size());
+        cloud_stale_warned_ = false;
+      } else if (!saw_first_cloud) {
+        RCLCPP_INFO(
+          get_logger(), "lidar cloud online: %zu points → %s",
+          cloud.points.size(), cloud_topic_.c_str());
+      }
+      saw_first_cloud = true;
+      last_cloud_steady_ = now_tp;
+      last_cloud_points_ = cloud.points.size();
+      publish_temperatures();
+
+      if (publish_raw_cloud_ && raw_cloud_pub_) {
+        publish_cloud(cloud, raw_cloud_pub_);
+      }
+
+      LidarFrame out = cloud;
+      if (deskew_enable_ && tf_buffer_) {
+        const DeskewResult dr = deskew_lidar_frame(
+          out, *tf_buffer_, deskew_motion_frame_, deskew_reference_,
+          deskew_tf_timeout_s_, get_logger(), *get_clock());
+        if (dr.ok) {
+          if (dr.elapsed_ms >= deskew_warn_ms_) {
+            RCLCPP_WARN(
+              get_logger(), "deskew took %.2f ms (warn threshold %.1f)",
+              dr.elapsed_ms, deskew_warn_ms_);
+          }
+          RCLCPP_INFO_THROTTLE(
+            get_logger(), *get_clock(), 5000,
+            "deskew wall time: %.2f ms", dr.elapsed_ms);
+        } else {
+          RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 2000,
+            "deskew skipped (%.2f ms): %s — publishing raw",
+            dr.elapsed_ms, dr.error.c_str());
+          out = cloud;
+        }
+      }
+
+      if (publish_cloud_) {
+        publish_cloud(out, cloud_pub_);
+        ++clouds_published_;
+        points_published_ += out.points.size();
+      }
     }
 
-    const auto now_tp = std::chrono::steady_clock::now();
-    static auto last_loc = now_tp - min_period;
-    if (now_tp - last_loc < min_period) {
-      continue;
-    }
-    last_loc = now_tp;
-
-    auto pose = localizer_->localize(cloud);
-    if (pose && pose->valid) {
-      const rclcpp::Time stamp(
-        cloud.timestamp_ns > 0 ? cloud.timestamp_ns : now().nanoseconds());
-      publish_pose(*pose, stamp);
+    if (status_log_period_s_ > 0.0 &&
+        (now_tp - last_status_log_) >=
+          std::chrono::duration<double>(status_log_period_s_))
+    {
+      const double dt = std::chrono::duration<double>(
+        now_tp - last_status_log_).count();
+      const LidarDeviceStatus st = lidar_ ? lidar_->get_status() : LidarDeviceStatus{};
+      if (st.core_temp_valid) {
+        RCLCPP_INFO(
+          get_logger(),
+          "lidar ok: %.1f Hz cloud, last %zu pts, core_temp=%.1f C",
+          clouds_published_ / std::max(dt, 1e-3),
+          last_cloud_points_, st.core_temp_c);
+      } else {
+        RCLCPP_INFO(
+          get_logger(),
+          "lidar ok: %.1f Hz cloud, last %zu pts (no core_temp yet)",
+          clouds_published_ / std::max(dt, 1e-3),
+          last_cloud_points_);
+      }
+      clouds_published_ = 0;
+      points_published_ = 0;
+      last_status_log_ = now_tp;
     }
   }
 }

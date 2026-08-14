@@ -4,6 +4,10 @@
   ros2 run composite_sensing multicam_rail_replay --ros-args \\
     -p dataset:=.../rail_sim/race-2_multicam -p rate_hz:=10.0
 
+Per-view ``T_wo`` is published as ``odom`` ← ``{view}_optical_frame`` (and
+aliases for depth/color optical), matching smoke_rail_mapper integration.
+``odom`` ← ``base_link`` still comes from ``poses_body.bin`` for viz/clearing.
+
 ClipSeg encoder packs N ``/{view}/color/image_raw`` into a Dora rgb batch when
 ``color_topics`` is configured (approximate sync by shared stamp).
 """
@@ -15,13 +19,12 @@ from pathlib import Path
 
 import numpy as np
 import rclpy
-import yaml
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image
-from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
+from tf2_ros import TransformBroadcaster
 
 
 def _load_kv(path: Path) -> dict:
@@ -102,6 +105,16 @@ def _rgb_msg(rgb: np.ndarray, frame_id: str, stamp) -> Image:
     return msg
 
 
+def _load_T_wo(frames: Path, stem: str, view: str) -> np.ndarray | None:
+    p = frames / f"{stem}_{view}_T_wo.bin"
+    if p.is_file():
+        return np.fromfile(p, dtype=np.float64).reshape(4, 4)
+    p_npy = frames / f"{stem}_{view}_T_wo.npy"
+    if p_npy.is_file():
+        return np.load(p_npy)
+    return None
+
+
 class MulticamRailReplay(Node):
     def __init__(self):
         super().__init__("multicam_rail_replay")
@@ -111,7 +124,7 @@ class MulticamRailReplay(Node):
         self.declare_parameter("global_frame", "odom")
         self.declare_parameter("base_frame", "base_link")
 
-        dataset = Path(self.get_parameter("dataset").as_string())
+        dataset = Path(str(self.get_parameter("dataset").value))
         if not dataset.is_dir():
             raise RuntimeError(f"dataset not found: {dataset}")
         self.dataset = dataset
@@ -126,14 +139,16 @@ class MulticamRailReplay(Node):
         self.fy = float(self.kv.get("fy", 400))
         self.cx = float(self.kv.get("cx", self.width / 2))
         self.cy = float(self.kv.get("cy", self.height / 2))
-        self.global_frame = self.get_parameter("global_frame").as_string()
-        self.base_frame = self.get_parameter("base_frame").as_string()
-        self.loop = self.get_parameter("loop").as_bool()
+        self.global_frame = str(self.get_parameter("global_frame").value)
+        self.base_frame = str(self.get_parameter("base_frame").value)
+        self.loop = bool(self.get_parameter("loop").value)
         self.idx = 0
+        self.tick_i = 0  # monotonic; never resets (loop wraps frame files only)
+        self.rate_hz = float(self.get_parameter("rate_hz").value)
 
-        self.tf_static = StaticTransformBroadcaster(self)
         self.tf_dyn = TransformBroadcaster(self)
-        self._publish_static_extrinsics()
+        # No static extrinsics: each tick publishes odom←{view}_*optical = T_wo
+        # (identity among link/optical aliases), matching DatasetCameraDevice GT.
 
         self.depth_pubs = {}
         self.depth_info_pubs = {}
@@ -156,39 +171,19 @@ class MulticamRailReplay(Node):
             Odometry, "/visual_slam/tracking/odometry", 10
         )
 
-        rate = float(self.get_parameter("rate_hz").as_double())
-        self.timer = self.create_timer(1.0 / max(rate, 0.1), self._tick)
+        self.timer = self.create_timer(1.0 / max(self.rate_hz, 0.1), self._tick)
         self.get_logger().info(
             f"multicam_rail_replay: {dataset} views={self.views} "
-            f"n={self.n_frames} @ {rate} Hz"
+            f"n={self.n_frames} @ {self.rate_hz} Hz "
+            f"(per-view T_wo → {self.global_frame}←{{view}}_optical)"
         )
 
-    def _publish_static_extrinsics(self):
-        stamp = self.get_clock().now().to_msg()
-        statics = []
-        for v in self.views:
-            t = TransformStamped()
-            t.header.stamp = stamp
-            t.header.frame_id = self.base_frame
-            t.child_frame_id = f"{v}_link"
-            t.transform.rotation.w = 1.0
-            statics.append(t)
-            T = np.eye(4)
-            T[:3, :3] = np.array(
-                [[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]],
-                dtype=np.float64,
-            )
-            statics.append(
-                _mat_to_tf(T, f"{v}_link", f"{v}_optical_frame", stamp)
-            )
-            for suffix in ("depth_optical_frame", "color_optical_frame"):
-                alias = TransformStamped()
-                alias.header.stamp = stamp
-                alias.header.frame_id = f"{v}_optical_frame"
-                alias.child_frame_id = f"{v}_{suffix}"
-                alias.transform.rotation.w = 1.0
-                statics.append(alias)
-        self.tf_static.sendTransform(statics)
+    def _stamp_for_tick(self, tick_i: int):
+        """Synthetic stamp = (tick+1)/rate so dump_elev frame_idx tracks ticks."""
+        ns = int(round((tick_i + 1) * 1e9 / max(self.rate_hz, 1e-6)))
+        return rclpy.time.Time(
+            nanoseconds=ns, clock_type=rclpy.clock.ClockType.ROS_TIME
+        ).to_msg()
 
     def _tick(self):
         if self.n_frames <= 0:
@@ -200,23 +195,27 @@ class MulticamRailReplay(Node):
 
         import cv2
 
-        stamp = self.get_clock().now().to_msg()
+        stamp = self._stamp_for_tick(self.tick_i)
         stem = f"{self.idx:06d}"
-        body_bin = self.dataset / "frames" / "poses_body.bin"
+        frames = self.dataset / "frames"
+        body_bin = frames / "poses_body.bin"
         if body_bin.is_file():
             with open(body_bin, "rb") as f:
                 f.seek(self.idx * 16 * 8)
                 raw = f.read(16 * 8)
             T_body = np.frombuffer(raw, dtype=np.float64).reshape(4, 4)
         else:
-            T_body = np.fromfile(
-                self.dataset / "frames" / f"{stem}_front_T_wo.bin",
-                dtype=np.float64,
-            ).reshape(4, 4)
+            T_front = _load_T_wo(frames, stem, "front")
+            if T_front is None:
+                self.get_logger().warn(f"missing body/front pose for {stem}")
+                self.idx += 1
+                self.tick_i += 1
+                return
+            T_body = T_front
 
-        self.tf_dyn.sendTransform(
+        dyn = [
             _mat_to_tf(T_body, self.global_frame, self.base_frame, stamp)
-        )
+        ]
         odom = Odometry()
         odom.header.stamp = stamp
         odom.header.frame_id = self.global_frame
@@ -224,12 +223,12 @@ class MulticamRailReplay(Node):
         odom.pose.pose.position.x = float(T_body[0, 3])
         odom.pose.pose.position.y = float(T_body[1, 3])
         odom.pose.pose.position.z = float(T_body[2, 3])
-        tf_msg = _mat_to_tf(T_body, self.global_frame, self.base_frame, stamp)
+        tf_msg = dyn[0]
         odom.pose.pose.orientation = tf_msg.transform.rotation
         self.odom_pub.publish(odom)
 
         for v in self.views:
-            prefix = self.dataset / "frames" / f"{stem}_{v}"
+            prefix = frames / f"{stem}_{v}"
             depth_mm = cv2.imread(
                 str(prefix) + "_depth_mm.png", cv2.IMREAD_UNCHANGED
             )
@@ -237,8 +236,24 @@ class MulticamRailReplay(Node):
             if depth_mm is None or trav_bgr is None:
                 self.get_logger().warn(f"missing frame {stem}_{v}")
                 self.idx += 1
+                self.tick_i += 1
                 return
-            opt = f"{v}_optical_frame"
+            T_wo = _load_T_wo(frames, stem, v)
+            if T_wo is None:
+                self.get_logger().warn(f"missing T_wo for {stem}_{v}")
+                self.idx += 1
+                self.tick_i += 1
+                return
+            # Raw T_wo as odom ← optical (and link aliases). Mapping looks up
+            # odom ← {v}_depth_optical_frame.
+            for child in (
+                f"{v}_link",
+                f"{v}_optical_frame",
+                f"{v}_depth_optical_frame",
+                f"{v}_color_optical_frame",
+            ):
+                dyn.append(_mat_to_tf(T_wo, self.global_frame, child, stamp))
+            opt = f"{v}_depth_optical_frame"
             self.depth_pubs[v].publish(_depth_msg(depth_mm, opt, stamp))
             self.depth_info_pubs[v].publish(
                 _camera_info(
@@ -252,8 +267,9 @@ class MulticamRailReplay(Node):
                     stamp,
                 )
             )
+            color_opt = f"{v}_color_optical_frame"
             rgb = trav_bgr[:, :, ::-1].copy()
-            self.color_pubs[v].publish(_rgb_msg(rgb, opt, stamp))
+            self.color_pubs[v].publish(_rgb_msg(rgb, color_opt, stamp))
             self.color_info_pubs[v].publish(
                 _camera_info(
                     self.width,
@@ -262,12 +278,14 @@ class MulticamRailReplay(Node):
                     self.fy,
                     self.cx,
                     self.cy,
-                    opt,
+                    color_opt,
                     stamp,
                 )
             )
 
+        self.tf_dyn.sendTransform(dyn)
         self.idx += 1
+        self.tick_i += 1
 
 
 def main(args=None):

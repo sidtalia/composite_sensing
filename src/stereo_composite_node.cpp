@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 
 #include <rclcpp/qos.hpp>
@@ -131,10 +132,26 @@ void StereoCompositeNode::declare_params()
   emitter_enabled_ = declare_parameter<int>("emitter_enabled", 0);
   visual_preset_ = declare_parameter<int>("visual_preset", 3);
   clip_distance_ = declare_parameter<double>("clip_distance", 0.0);
+  initial_reset_ = declare_parameter<bool>("initial_reset", false);
   odom_topic_ = declare_parameter<std::string>(
     "odom_topic", "/visual_slam/tracking/odometry");
   odom_frame_ = declare_parameter<std::string>("odom_frame", "odom");
-  base_frame_ = declare_parameter<std::string>("base_frame", "camera_link");
+  base_frame_ = declare_parameter<std::string>("base_frame", "base_link");
+  publish_odom_tf_ = declare_parameter<bool>("publish_odom_tf", false);
+  {
+    t_body_sensor_[0] = declare_parameter<double>("xyz.x", 0.0);
+    t_body_sensor_[1] = declare_parameter<double>("xyz.y", 0.0);
+    t_body_sensor_[2] = declare_parameter<double>("xyz.z", 0.0);
+    const double roll = declare_parameter<double>("rpy.roll", 0.0);
+    const double pitch = declare_parameter<double>("rpy.pitch", 0.0);
+    const double yaw = declare_parameter<double>("rpy.yaw", 0.0);
+    rpy_deg_to_R(roll, pitch, yaw, R_body_sensor_);
+    const double tnorm =
+      std::abs(t_body_sensor_[0]) + std::abs(t_body_sensor_[1]) +
+      std::abs(t_body_sensor_[2]);
+    apply_body_mount_ = tnorm > 1e-9 ||
+      std::abs(roll) > 1e-9 || std::abs(pitch) > 1e-9 || std::abs(yaw) > 1e-9;
+  }
   async_sba_ = declare_parameter<bool>("async_sba", true);
   slam_sync_mode_ = declare_parameter<bool>("slam_sync_mode", false);
   warmup_frames_ = declare_parameter<int>("warmup_frames", 60);
@@ -165,13 +182,22 @@ void StereoCompositeNode::declare_params()
 
 void StereoCompositeNode::start_pipeline()
 {
+  if (initial_reset_) {
+    RCLCPP_INFO(
+      get_logger(),
+      "initial_reset: hardware_reset on serial %s (wait for re-enumerate)",
+      serial_number_.c_str());
+  }
+
   try {
-    rs_ = open_rs_sensors(
+    open_rs_sensors(
+      rs_,
       serial_number_,
       infra_width_, infra_height_, infra_fps_,
       enable_color_, color_width_, color_height_, color_fps_,
       enable_depth_, depth_width_, depth_height_, depth_fps_,
-      visual_preset_, emitter_enabled_, static_cast<float>(clip_distance_));
+      visual_preset_, emitter_enabled_, static_cast<float>(clip_distance_),
+      initial_reset_);
   } catch (const rs2::error & e) {
     throw std::runtime_error(
       std::string("RealSense start failed (is another process using the camera?): ") +
@@ -542,6 +568,14 @@ void StereoCompositeNode::publish_odom_tf(
   std::array<double, 3> t{};
   std::array<double, 4> q{};
   optical_pose_to_ros_flu(pose, t, q);
+  if (apply_body_mount_) {
+    std::array<double, 3> t_body{};
+    std::array<double, 4> q_body{};
+    world_sensor_to_world_body(
+      t, q, R_body_sensor_, t_body_sensor_, t_body, q_body);
+    t = t_body;
+    q = q_body;
+  }
 
   nav_msgs::msg::Odometry odom;
   odom.header.stamp = stamp;
@@ -567,6 +601,9 @@ void StereoCompositeNode::publish_odom_tf(
   prev_stamp_ = stamp;
   odom_pub_->publish(odom);
 
+  if (!publish_odom_tf_) {
+    return;
+  }
   geometry_msgs::msg::TransformStamped tf;
   tf.header.stamp = stamp;
   tf.header.frame_id = odom_frame_;

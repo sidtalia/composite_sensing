@@ -2,11 +2,11 @@
 
 Stereo + lidar composite sensing for HOUND.
 
-- **`CameraDevice` / `RealsenseCameraDevice`** — transport-agnostic stereo/color/depth
+- **`CameraDevice` / `RealsenseCameraDevice` / `DatasetCameraDevice`** — transport-agnostic stereo/color/depth (RealSense or rail-sim PNG dataset)
 - **`VslamBackend` / `CuvslamBackend`** — VO/SLAM from stereo frames (Isaac `libcuvslam`)
-- **`LidarDevice` / `UnilidarLidarDevice`** — Unitree SDK hot path (Ouster/Livox adapters TBD)
+- **`LidarDevice` / `UnilidarLidarDevice` / `LivoxLidarDevice`** — Unitree + Livox Mid-360(S) (SDK2); Ouster TBD
 - **`MeshLocalizerBackend` / `ConstantTwistMeshPfBackend`** — Embree mesh PF, internal constant-twist motion (no EKF odom)
-- **Nodes:** `stereo_composite_modular_node`, `lidar_mesh_composite_node`
+- **Nodes:** `stereo_composite_modular_node`, `lidar_mesh_composite_node`, `multicam_rail_replay`
 
 `lidar_mesh_composite_node` publishes `/localization/mesh_pose` (`PoseWithCovarianceStamped`) as a map-absolute aid for the EKF, plus optional `/unilidar/cloud` and static `parent→lidar` TF. Relocalize: `ros2 service call /lidar_mesh_composite/global_localization std_srvs/srv/Empty {}`.
 
@@ -53,6 +53,17 @@ Prefer launching via `hound_core` SSoT (`stereo_composite:` / `lidar.composite:`
 ```bash
 ros2 run composite_sensing stereo_composite_modular_node --ros-args \
   -p serial_number:=030422250301 -p enable_color:=true
+
+# DatasetCameraDevice (rail sim) via the same modular node:
+ros2 run composite_sensing stereo_composite_modular_node --ros-args \
+  -p camera_backend:=dataset \
+  -p dataset_path:=/path/to/rail_sim/race-2_multicam \
+  -p dataset_view:=front \
+  -p dataset_rate_hz:=10.0 \
+  -p enable_vslam:=false \
+  -p warmup_frames:=0 \
+  -p enable_color:=true -p enable_depth:=true \
+  -p camera_name:=front -p base_frame:=front_link
 
 ros2 run composite_sensing lidar_mesh_composite_node --ros-args \
   -p port:=/dev/ttyUSB0 \

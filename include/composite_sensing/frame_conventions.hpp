@@ -126,4 +126,59 @@ inline void flu_to_optical_quat(std::array<double, 4> & q_xyzw)
   q_xyzw = {-0.5, 0.5, -0.5, 0.5};
 }
 
+/** Intrinsic XYZ RPY (deg) → row-major R, matching tf2 Quaternion.setRPY. */
+inline void rpy_deg_to_R(
+  double roll_deg, double pitch_deg, double yaw_deg, std::array<double, 9> & R)
+{
+  constexpr double kDeg = 0.017453292519943295;
+  const double r = roll_deg * kDeg, p = pitch_deg * kDeg, y = yaw_deg * kDeg;
+  const double cr = std::cos(r), sr = std::sin(r);
+  const double cp = std::cos(p), sp = std::sin(p);
+  const double cy = std::cos(y), sy = std::sin(y);
+  R[0] = cy * cp;
+  R[1] = cy * sp * sr - sy * cr;
+  R[2] = cy * sp * cr + sy * sr;
+  R[3] = sy * cp;
+  R[4] = sy * sp * sr + cy * cr;
+  R[5] = sy * sp * cr - cy * sr;
+  R[6] = -sp;
+  R[7] = cp * sr;
+  R[8] = cp * cr;
+}
+
+/**
+ * T_world_body = T_world_sensor * inv(T_body_sensor).
+ * ``R_bs`` / ``t_bs`` are the static mount (body → sensor), same as SSoT xyz/rpy.
+ */
+inline void world_sensor_to_world_body(
+  const std::array<double, 3> & t_ws,
+  const std::array<double, 4> & q_ws,
+  const std::array<double, 9> & R_bs,
+  const std::array<double, 3> & t_bs,
+  std::array<double, 3> & t_wb,
+  std::array<double, 4> & q_wb)
+{
+  const std::array<double, 9> R_sb = {
+    R_bs[0], R_bs[3], R_bs[6],
+    R_bs[1], R_bs[4], R_bs[7],
+    R_bs[2], R_bs[5], R_bs[8],
+  };
+  std::array<double, 3> t_sb{};
+  mat_vec_3(R_sb, t_bs, t_sb);
+  t_sb[0] = -t_sb[0];
+  t_sb[1] = -t_sb[1];
+  t_sb[2] = -t_sb[2];
+
+  std::array<double, 9> R_ws{};
+  quat_xyzw_to_rotation_matrix(q_ws, R_ws);
+  std::array<double, 9> R_wb{};
+  mat_mul_3x3(R_ws, R_sb, R_wb);
+  std::array<double, 3> delta{};
+  mat_vec_3(R_ws, t_sb, delta);
+  t_wb[0] = t_ws[0] + delta[0];
+  t_wb[1] = t_ws[1] + delta[1];
+  t_wb[2] = t_ws[2] + delta[2];
+  rotation_matrix_to_quat_xyzw(R_wb, q_wb);
+}
+
 }  // namespace composite_sensing

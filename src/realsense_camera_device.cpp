@@ -52,12 +52,14 @@ void RealsenseCameraDevice::open(const CameraOpenConfig & config)
   }
 
   try {
-    rs_ = open_rs_sensors(
+    open_rs_sensors(
+      rs_,
       config.serial,
       config.infra_width, config.infra_height, config.infra_fps,
       enable_color, config.color_width, config.color_height, config.color_fps,
       config.enable_depth, depth_w, depth_h, depth_fps,
-      config.visual_preset, config.emitter_enabled, config.clip_distance_m);
+      config.visual_preset, config.emitter_enabled, config.clip_distance_m,
+      config.initial_reset);
   } catch (const rs2::error & e) {
     throw std::runtime_error(
       std::string("RealSense start failed (is another process using the camera?): ") +

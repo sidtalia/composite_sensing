@@ -92,9 +92,14 @@ private:
   int emitter_enabled_{0};
   int visual_preset_{3};  // rs400: 3 = high_accuracy
   double clip_distance_{0.0};
+  bool initial_reset_{false};
   std::string odom_topic_;
   std::string odom_frame_;
   std::string base_frame_;
+  bool publish_odom_tf_{false};
+  bool apply_body_mount_{false};
+  std::array<double, 3> t_body_sensor_{{0, 0, 0}};
+  std::array<double, 9> R_body_sensor_{{1, 0, 0, 0, 1, 0, 0, 0, 1}};
   bool async_sba_{true};
   bool slam_sync_mode_{false};
   int warmup_frames_{60};

@@ -1,8 +1,11 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -47,11 +50,15 @@ struct RsSensorStreams {
   bool has_color_sensor{false};
   bool stereo_started{false};
   bool color_started{false};
+  float clip_distance_applied{0.f};
 
   RsStreamProfiles profiles{};
   // Syncer pairs IR1+IR2 (sensor.start enqueues single frames, not framesets).
-  rs2::syncer ir_sync{2};
-  rs2::frame_queue color_queue{1};
+  rs2::syncer ir_sync{4};
+  rs2::frame_queue color_queue{4};
+
+  // No destructor that calls stop(): open_rs_sensors used to return-by-value and a
+  // ~RsSensorStreams(){stop()} would halt streams when the temporary was destroyed.
 
   void stop()
   {
@@ -65,12 +72,25 @@ struct RsSensorStreams {
     }
     try {
       if (stereo_started) {
+        // Only undo options we explicitly applied. Forcing VISUAL_PRESET=0 on
+        // every stop has left D455 depth/color wedged until a Viewer/USB reset.
+        try {
+          if (clip_distance_applied > 0.f &&
+            stereo.supports(RS2_OPTION_MAX_DISTANCE))
+          {
+            stereo.set_option(RS2_OPTION_MAX_DISTANCE, 16.0f);
+          }
+        } catch (...) {
+        }
         stereo.stop();
         stereo.close();
         stereo_started = false;
       }
     } catch (...) {
     }
+    clip_distance_applied = 0.f;
+    has_color_sensor = false;
+    profiles = {};
   }
 };
 
@@ -92,6 +112,75 @@ inline rs2::device find_device(const std::string & serial)
     }
   }
   throw std::runtime_error("RealSense serial not found: " + serial);
+}
+
+/**
+ * Like realsense2_camera ``initial_reset``: USB disconnect/reconnect clears
+ * sticky firmware/USB state left by unclean shutdowns.
+ *
+ * The ROS wrapper clears the handle then sleeps ``reconnect_timeout`` (default
+ * 6 s) before re-querying. Grabbing the device as soon as it re-lists is too
+ * early — XU/UVC controls still fail with Protocol error. We wait for the
+ * serial to drop (when possible), reappear, then settle before returning.
+ */
+inline void hardware_reset_and_wait(
+  const std::string & serial,
+  double wait_timeout_s = 20.0,
+  double settle_s = 3.0)
+{
+  std::string sn = serial;
+  {
+    rs2::device dev = find_device(serial);
+    if (sn.empty() && dev.supports(RS2_CAMERA_INFO_SERIAL_NUMBER)) {
+      sn = dev.get_info(RS2_CAMERA_INFO_SERIAL_NUMBER);
+    }
+    dev.hardware_reset();
+  }
+
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto deadline =
+    t0 + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+      std::chrono::duration<double>(wait_timeout_s));
+  // Do not touch the device until USB has had time to drop (ROS ~6 s default).
+  const auto earliest_ready =
+    t0 + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+      std::chrono::duration<double>(std::max(4.0, settle_s + 1.0)));
+
+  bool saw_disconnect = false;
+  while (std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    bool present = false;
+    try {
+      rs2::device d = find_device(sn);
+      // Probe sensors — listing alone is not enough after reset.
+      (void)d.query_sensors();
+      present = true;
+    } catch (const std::exception &) {
+      present = false;
+    }
+
+    if (!present) {
+      saw_disconnect = true;
+      continue;
+    }
+    if (!saw_disconnect && std::chrono::steady_clock::now() < earliest_ready) {
+      // Still the pre-reset enumeration (or half-ready). Keep waiting.
+      continue;
+    }
+    std::this_thread::sleep_for(
+      std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(settle_s)));
+    try {
+      rs2::device d = find_device(sn);
+      (void)d.query_sensors();
+      return;
+    } catch (const std::exception &) {
+      // Fell out again during settle; keep looping.
+    }
+  }
+  throw std::runtime_error(
+    "RealSense did not become ready after hardware_reset"
+    + (sn.empty() ? std::string() : (": " + sn)));
 }
 
 inline rs2::video_stream_profile pick_video_profile(
@@ -150,17 +239,24 @@ inline void apply_visual_preset(rs2::sensor & sensor, int preset)
   if (preset < 0) {
     return;
   }
-  if (sensor.supports(RS2_OPTION_VISUAL_PRESET)) {
-    sensor.set_option(RS2_OPTION_VISUAL_PRESET, static_cast<float>(preset));
+  try {
+    if (sensor.supports(RS2_OPTION_VISUAL_PRESET)) {
+      sensor.set_option(RS2_OPTION_VISUAL_PRESET, static_cast<float>(preset));
+    }
+  } catch (const rs2::error &) {
+    // XU can flake; streams may still start with firmware default preset.
   }
 }
 
 inline void apply_emitter(rs2::sensor & sensor, int emitter_enabled)
 {
-  if (!sensor.supports(RS2_OPTION_EMITTER_ENABLED)) {
-    return;
+  try {
+    if (!sensor.supports(RS2_OPTION_EMITTER_ENABLED)) {
+      return;
+    }
+    sensor.set_option(RS2_OPTION_EMITTER_ENABLED, static_cast<float>(emitter_enabled));
+  } catch (const rs2::error &) {
   }
-  sensor.set_option(RS2_OPTION_EMITTER_ENABLED, static_cast<float>(emitter_enabled));
 }
 
 inline void apply_clip_distance(rs2::sensor & sensor, float clip_m)
@@ -168,64 +264,107 @@ inline void apply_clip_distance(rs2::sensor & sensor, float clip_m)
   if (clip_m <= 0.f) {
     return;
   }
-  if (sensor.supports(RS2_OPTION_MAX_DISTANCE)) {
-    sensor.set_option(RS2_OPTION_MAX_DISTANCE, clip_m);
+  try {
+    if (sensor.supports(RS2_OPTION_MAX_DISTANCE)) {
+      sensor.set_option(RS2_OPTION_MAX_DISTANCE, clip_m);
+    }
+  } catch (const rs2::error &) {
   }
 }
 
 /**
  * Open stereo (IR ± depth) and optional color on separate sensors / queues.
  * IR Track never waits on RGB frameset sync.
+ * Writes into ``out`` in place (do not return-by-value after sensor.start).
  */
-inline RsSensorStreams open_rs_sensors(
+inline void open_rs_sensors(
+  RsSensorStreams & out,
   const std::string & serial,
   int infra_w, int infra_h, int infra_fps,
   bool enable_color, int color_w, int color_h, int color_fps,
   bool enable_depth, int depth_w, int depth_h, int depth_fps,
-  int visual_preset, int emitter_enabled, float clip_m)
+  int visual_preset, int emitter_enabled, float clip_m,
+  bool initial_reset = false)
 {
-  RsSensorStreams out;
-  out.device = find_device(serial);
-  out.stereo = find_stereo_sensor(out.device);
+  out.stop();
+  out.profiles = {};
+  out.has_color_sensor = false;
 
-  // Options before start (preset can reset emitter).
-  apply_visual_preset(out.stereo, visual_preset);
-  apply_emitter(out.stereo, emitter_enabled);
-  apply_clip_distance(out.stereo, clip_m);
-
-  out.profiles.infra1 = pick_video_profile(
-    out.stereo, RS2_STREAM_INFRARED, 1, infra_w, infra_h, RS2_FORMAT_Y8, infra_fps);
-  out.profiles.infra2 = pick_video_profile(
-    out.stereo, RS2_STREAM_INFRARED, 2, infra_w, infra_h, RS2_FORMAT_Y8, infra_fps);
-
-  std::vector<rs2::stream_profile> stereo_profiles{
-    out.profiles.infra1, out.profiles.infra2};
-
-  if (enable_depth) {
-    out.profiles.depth = pick_video_profile(
-      out.stereo, RS2_STREAM_DEPTH, 0, depth_w, depth_h, RS2_FORMAT_Z16, depth_fps);
-    out.profiles.has_depth = true;
-    stereo_profiles.push_back(out.profiles.depth);
+  if (initial_reset) {
+    hardware_reset_and_wait(serial);
   }
 
-  out.stereo.open(stereo_profiles);
-  // Feed the syncer so IR1+IR2 become matched framesets for Track.
-  // Callback thread → ir_sync; Track thread dequeues (queue latency ≠ 0).
-  out.stereo.start(out.ir_sync);
-  out.stereo_started = true;
+  // XU/UVC can still flake right after re-enumerate; retry like Viewer does.
+  constexpr int k_open_attempts = 4;
+  std::exception_ptr last_err;
+  for (int attempt = 1; attempt <= k_open_attempts; ++attempt) {
+    try {
+      out.stop();
+      out.profiles = {};
+      out.has_color_sensor = false;
 
-  if (enable_color) {
-    out.color = find_color_sensor(out.device);
-    out.profiles.color = pick_video_profile(
-      out.color, RS2_STREAM_COLOR, 0, color_w, color_h, RS2_FORMAT_RGB8, color_fps);
-    out.profiles.has_color = true;
-    out.has_color_sensor = true;
-    out.color.open(out.profiles.color);
-    out.color.start(out.color_queue);
-    out.color_started = true;
+      out.device = find_device(serial);
+      out.stereo = find_stereo_sensor(out.device);
+
+      // Options before start (preset can reset emitter).
+      apply_visual_preset(out.stereo, visual_preset);
+      apply_emitter(out.stereo, emitter_enabled);
+      apply_clip_distance(out.stereo, clip_m);
+      out.clip_distance_applied = clip_m > 0.f ? clip_m : 0.f;
+
+      out.profiles.infra1 = pick_video_profile(
+        out.stereo, RS2_STREAM_INFRARED, 1, infra_w, infra_h, RS2_FORMAT_Y8, infra_fps);
+      out.profiles.infra2 = pick_video_profile(
+        out.stereo, RS2_STREAM_INFRARED, 2, infra_w, infra_h, RS2_FORMAT_Y8, infra_fps);
+
+      std::vector<rs2::stream_profile> stereo_profiles{
+        out.profiles.infra1, out.profiles.infra2};
+
+      if (enable_depth) {
+        out.profiles.depth = pick_video_profile(
+          out.stereo, RS2_STREAM_DEPTH, 0, depth_w, depth_h, RS2_FORMAT_Z16, depth_fps);
+        out.profiles.has_depth = true;
+        stereo_profiles.push_back(out.profiles.depth);
+      }
+
+      out.stereo.open(stereo_profiles);
+      // Feed the syncer so IR1+IR2 become matched framesets for Track.
+      // Callback thread → ir_sync; Track thread dequeues (queue latency ≠ 0).
+      out.stereo.start(out.ir_sync);
+      out.stereo_started = true;
+
+      if (enable_color) {
+        out.color = find_color_sensor(out.device);
+        out.profiles.color = pick_video_profile(
+          out.color, RS2_STREAM_COLOR, 0, color_w, color_h, RS2_FORMAT_RGB8, color_fps);
+        out.profiles.has_color = true;
+        out.has_color_sensor = true;
+        out.color.open(out.profiles.color);
+        out.color.start(out.color_queue);
+        out.color_started = true;
+      }
+      return;
+    } catch (const rs2::error & e) {
+      last_err = std::current_exception();
+      out.stop();
+      if (attempt == k_open_attempts) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1500 * attempt));
+      (void)e;
+    } catch (const std::exception & e) {
+      last_err = std::current_exception();
+      out.stop();
+      if (attempt == k_open_attempts) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1500 * attempt));
+      (void)e;
+    }
   }
-
-  return out;
+  if (last_err) {
+    std::rethrow_exception(last_err);
+  }
 }
 
 /** rs2 optical extrinsics → ROS FLU pose of stream body frame in camera_link. */
