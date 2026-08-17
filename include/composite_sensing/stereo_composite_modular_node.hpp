@@ -19,6 +19,7 @@
 #include <tf2_ros/transform_broadcaster.h>
 
 #include "composite_sensing/camera_device.hpp"
+#include "composite_sensing/color_sync_shm.hpp"
 #include "composite_sensing/dataset_camera_device.hpp"
 #include "composite_sensing/realsense_camera_device.hpp"
 #include "composite_sensing/vslam_backend.hpp"
@@ -68,6 +69,7 @@ private:
   void depth_worker();
   void publish_odom_tf(const rclcpp::Time & stamp, const PoseOptical & pose);
   void publish_gt_odom(const rclcpp::Time & stamp, const PoseOptical & pose);
+  void publish_color_slot(sensor_msgs::msg::Image img, const rclcpp::Time & stamp);
 
   // Params (startup-only) — names match legacy realsense_cuvslam_node
   std::string serial_number_;
@@ -118,6 +120,26 @@ private:
   bool log_cuvslam_timing_{false};
   /** Off by default: SDK TIME_OF_ARRIVAL → Track + dequeue→Track handoff. */
   bool profile_{false};
+  /** Periodic raw RGB/depth ingress vs publish rates (per camera node). */
+  bool log_sensor_rates_{true};
+  double sensor_rate_log_every_s_{5.0};
+  /**
+   * Color multi-cam phase sync via POSIX shm (no ROS):
+   * ``master`` strides and writes last publish stamp;
+   * ``follower`` finds sensor frame nearest master_stamp+period, then strides on that phase;
+   * ``standalone`` independent stride.
+   */
+  std::string color_sync_role_{"standalone"};
+  std::string color_sync_shm_name_;
+
+  std::atomic<uint64_t> color_in_n_{0};
+  std::atomic<uint64_t> color_keep_n_{0};
+  std::atomic<uint64_t> color_pub_n_{0};
+  std::atomic<uint64_t> depth_in_n_{0};
+  std::atomic<uint64_t> depth_pub_n_{0};
+  std::atomic<uint64_t> ir_in_n_{0};
+
+  ColorSyncShm color_sync_shm_;
 
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
   /** Dataset GT optical→FLU odom, same stamp as est when available. */

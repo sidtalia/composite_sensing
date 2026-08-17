@@ -3,11 +3,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <optional>
 
 #include <rclcpp/qos.hpp>
 
+#include "composite_sensing/color_sync_shm.hpp"
 #include "composite_sensing/cuvslam_backend.hpp"
 #include "composite_sensing/dataset_camera_device.hpp"
 #include "composite_sensing/frame_conventions.hpp"
@@ -19,6 +21,12 @@ namespace {
 rclcpp::QoS sensor_qos(size_t depth = 5)
 {
   return rclcpp::SensorDataQoS().keep_last(depth);
+}
+
+/** Color for seg: RELIABLE so large RGB frames aren't dropped under load. */
+rclcpp::QoS color_image_qos(size_t depth = 10)
+{
+  return rclcpp::QoS(rclcpp::KeepLast(depth)).reliable().durability_volatile();
 }
 
 cuvslam::Pose pose_optical_to_cuvslam(const PoseOptical & p)
@@ -53,9 +61,26 @@ StereoCompositeModularNode::StereoCompositeModularNode(
 
   if (enable_color_) {
     const std::string base = "/" + camera_name_ + "/color";
-    color_pub_ = create_publisher<sensor_msgs::msg::Image>(base + "/image_raw", sensor_qos());
+    color_pub_ = create_publisher<sensor_msgs::msg::Image>(
+      base + "/image_raw", color_image_qos());
     color_info_pub_ = create_publisher<sensor_msgs::msg::CameraInfo>(
-      base + "/camera_info", sensor_qos());
+      base + "/camera_info", color_image_qos());
+    if ((color_sync_role_ == "master" || color_sync_role_ == "follower") &&
+      !color_sync_shm_name_.empty())
+    {
+      const bool create = (color_sync_role_ == "master");
+      if (!color_sync_shm_.open(color_sync_shm_name_, create)) {
+        RCLCPP_ERROR(
+          get_logger(),
+          "color sync shm open failed name=%s role=%s errno-style check dmesg/ulimit",
+          color_sync_shm_name_.c_str(), color_sync_role_.c_str());
+      } else {
+        RCLCPP_INFO(
+          get_logger(),
+          "color sync %s shm=%s (phase-lock followers to master publish + period)",
+          color_sync_role_.c_str(), color_sync_shm_name_.c_str());
+      }
+    }
   }
   if (enable_depth_) {
     if (align_depth_ && !enable_color_) {
@@ -65,9 +90,9 @@ StereoCompositeModularNode::StereoCompositeModularNode(
       enable_color_ = true;
       const std::string cbase = "/" + camera_name_ + "/color";
       color_pub_ = create_publisher<sensor_msgs::msg::Image>(
-        cbase + "/image_raw", sensor_qos());
+        cbase + "/image_raw", color_image_qos());
       color_info_pub_ = create_publisher<sensor_msgs::msg::CameraInfo>(
-        cbase + "/camera_info", sensor_qos());
+        cbase + "/camera_info", color_image_qos());
     }
     const std::string base = align_depth_
       ? ("/" + camera_name_ + "/aligned_depth_to_color")
@@ -153,6 +178,8 @@ void StereoCompositeModularNode::declare_params()
   color_height_ = declare_parameter<int>("color_height", 360);
   color_fps_ = declare_parameter<int>("color_fps", 30);
   color_publish_fps_ = declare_parameter<double>("color_publish_fps", 15.0);
+  color_sync_role_ = declare_parameter<std::string>("color_sync_role", "standalone");
+  color_sync_shm_name_ = declare_parameter<std::string>("color_sync_shm_name", "");
   enable_depth_ = declare_parameter<bool>("enable_depth", false);
   align_depth_ = declare_parameter<bool>("align_depth", true);
   depth_width_ = declare_parameter<int>("depth_width", 640);
@@ -187,6 +214,8 @@ void StereoCompositeModularNode::declare_params()
   warmup_frames_ = declare_parameter<int>("warmup_frames", 60);
   log_cuvslam_timing_ = declare_parameter<bool>("log_cuvslam_timing", false);
   profile_ = declare_parameter<bool>("profile", false);
+  log_sensor_rates_ = declare_parameter<bool>("log_sensor_rates", true);
+  sensor_rate_log_every_s_ = declare_parameter<double>("sensor_rate_log_every_s", 5.0);
 
   if (enable_depth_ && !enable_color_ && align_depth_) {
     RCLCPP_WARN(
@@ -329,16 +358,38 @@ void StereoCompositeModularNode::capture_loop()
   int n_skip_ts = 0;
   int n_ir_frames = 0;
   int color_raw_count = 0;
-  const int color_stride = (enable_color_ && color_publish_fps_ > 0.0)
-    ? std::max(
-      1,
-      static_cast<int>(std::lround(
-        static_cast<double>(color_fps_) / color_publish_fps_)))
-    : 1;
+  const bool color_is_follower = (color_sync_role_ == "follower");
+  const bool color_is_master = (color_sync_role_ == "master");
+  const int color_stride =
+    (enable_color_ && color_publish_fps_ > 0.0)
+      ? std::max(
+        1,
+        static_cast<int>(std::lround(
+          static_cast<double>(color_fps_) / color_publish_fps_)))
+      : 1;
+  const int64_t color_period_ns =
+    (color_publish_fps_ > 0.0)
+      ? std::max<int64_t>(
+        1, static_cast<int64_t>(std::llround(1e9 / color_publish_fps_)))
+      : 0;
+  // Follower: seek frame nearest (front_stamp + period), then lock stride phase.
+  enum class SyncSeek { kWaitFront, kSeekMin, kLocked };
+  SyncSeek seek = color_is_follower ? SyncSeek::kWaitFront : SyncSeek::kLocked;
+  int locked_phase = 0;  // publish when (count % stride) == locked_phase
+  int64_t seek_target_ns = -1;
+  int64_t best_offset_ns = -1;
+  int best_phase = 0;
+  bool saw_decrease = false;
+  int frames_after_best = 0;
+  int wait_front_tries = 0;
   auto stats_t0 = clock::now();
   auto profile_t0 = stats_t0;
+  auto rate_t0 = stats_t0;
   const bool log_timing = log_cuvslam_timing_;
   const bool profile = profile_;
+  const bool log_rates = log_sensor_rates_;
+  const auto rate_period = std::chrono::duration<double>(
+    std::max(1.0, sensor_rate_log_every_s_));
   double sum_sdk_to_track_ms = 0.0;
   double sum_deq_to_track_ms = 0.0;
   double max_sdk_to_track_ms = 0.0;
@@ -353,28 +404,101 @@ void StereoCompositeModularNode::capture_loop()
   }
 
   if (enable_color_) {
-    RCLCPP_INFO(
-      get_logger(),
-      "color publish: every %d sensor frame(s) (%d Hz raw → ~%.1f Hz)",
-      color_stride, color_fps_,
-      static_cast<double>(color_fps_) / static_cast<double>(color_stride));
+    if (color_is_follower) {
+      RCLCPP_INFO(
+        get_logger(),
+        "color publish: FOLLOWER phase-lock (stride=%d, period=%.1f ms, shm=%s)",
+        color_stride, color_period_ns * 1e-6, color_sync_shm_name_.c_str());
+    } else {
+      RCLCPP_INFO(
+        get_logger(),
+        "color publish: every %d sensor frame(s) (%d Hz raw → ~%.1f Hz)%s",
+        color_stride, color_fps_,
+        static_cast<double>(color_fps_) / static_cast<double>(color_stride),
+        color_is_master ? " [MASTER shm stamp]" : "");
+    }
   }
 
   while (running_ && rclcpp::ok()) {
     const auto iter_t0 = clock::now();
 
-    // Drain color; keep every Nth for publish (does not gate Track).
     if (enable_color_) {
       ColorFrame color_f;
       while (camera_->poll_color(color_f)) {
+        color_in_n_.fetch_add(1, std::memory_order_relaxed);
         ++color_raw_count;
-        if ((color_raw_count % color_stride) != 0) {
+        const int phase = color_raw_count % color_stride;
+        const auto stamp = this->get_clock()->now();
+        const int64_t t_ns = stamp.nanoseconds();
+
+        if (color_is_follower && seek != SyncSeek::kLocked) {
+          if (seek == SyncSeek::kWaitFront) {
+            if (!color_sync_shm_.ok()) {
+              // Master may not have created/sized the segment yet.
+              if ((wait_front_tries++ % 30) == 0) {
+                color_sync_shm_.open(color_sync_shm_name_, /*create=*/false);
+              }
+            }
+            uint64_t front_ns = 0;
+            if (color_sync_shm_.read_stamp_ns(&front_ns) && color_period_ns > 0) {
+              // Next front publish slot strictly after now (or slightly ahead).
+              seek_target_ns = static_cast<int64_t>(front_ns) + color_period_ns;
+              while (seek_target_ns < t_ns + color_period_ns / 4) {
+                seek_target_ns += color_period_ns;
+              }
+              seek = SyncSeek::kSeekMin;
+              best_offset_ns = -1;
+              saw_decrease = false;
+              frames_after_best = 0;
+              RCLCPP_INFO(
+                get_logger(),
+                "color sync seek: target in %.1f ms (period=%.1f)",
+                (seek_target_ns - t_ns) * 1e-6, color_period_ns * 1e-6);
+            } else if ((wait_front_tries % 150) == 1) {
+              RCLCPP_WARN_THROTTLE(
+                get_logger(), *get_clock(), 2000,
+                "color sync waiting for master stamp on %s",
+                color_sync_shm_name_.c_str());
+            }
+            continue;  // do not publish until phase locked
+          }
+          // kSeekMin: watch |t - target|; lock when offset rises after a minimum
+          // (or after a few frames past the best — don't hang forever).
+          if (t_ns + color_period_ns < seek_target_ns) {
+            continue;  // still well before target
+          }
+          const int64_t offset = std::llabs(t_ns - seek_target_ns);
+          if (best_offset_ns < 0 || offset < best_offset_ns) {
+            best_offset_ns = offset;
+            best_phase = phase;
+            saw_decrease = true;
+            frames_after_best = 0;
+          } else if (saw_decrease) {
+            ++frames_after_best;
+            const bool rose = offset > best_offset_ns + 500000;  // +0.5 ms
+            const bool enough = frames_after_best >= 3;
+            const bool timed_out = t_ns > seek_target_ns + color_period_ns;
+            if (rose || enough || timed_out) {
+              locked_phase = best_phase;
+              seek = SyncSeek::kLocked;
+              RCLCPP_INFO(
+                get_logger(),
+                "color sync LOCKED phase=%d/%d (best_offset=%.2f ms)%s",
+                locked_phase, color_stride, best_offset_ns * 1e-6,
+                timed_out ? " [timeout]" : (enough && !rose ? " [plateau]" : ""));
+            }
+          }
+          if (seek != SyncSeek::kLocked) {
+            continue;
+          }
+        }
+
+        const int pub_phase = color_is_follower ? locked_phase : 0;
+        if (phase != pub_phase) {
           continue;
         }
-        const auto stamp = this->get_clock()->now();
+
         sensor_msgs::msg::Image img;
-        img.header.stamp = stamp;
-        img.header.frame_id = color_optical_frame_;
         img.height = static_cast<uint32_t>(color_f.height);
         img.width = static_cast<uint32_t>(color_f.width);
         img.encoding = "rgb8";
@@ -384,14 +508,10 @@ void StereoCompositeModularNode::capture_loop()
         const size_t nbytes = static_cast<size_t>(img.step) * img.height;
         img.data.resize(nbytes);
         std::memcpy(img.data.data(), color_f.pixels, nbytes);
-        {
-          std::lock_guard<std::mutex> lock(slot_.mu);
-          slot_.color_image = std::move(img);
-          slot_.color_stamp = stamp;
-          slot_.has_color = true;
-          ++slot_.color_seq;
+        publish_color_slot(std::move(img), stamp);
+        if (color_is_master && color_sync_shm_.ok()) {
+          color_sync_shm_.write_stamp_ns(static_cast<uint64_t>(t_ns));
         }
-        slot_.cv_color.notify_one();
       }
     }
 
@@ -399,6 +519,44 @@ void StereoCompositeModularNode::capture_loop()
     if (!camera_->wait_stereo(stereo, 1000)) {
       continue;
     }
+    ir_in_n_.fetch_add(1, std::memory_order_relaxed);
+    if (enable_depth_) {
+      // Depth rides the stereo module frameset (native) or aligns from it.
+      depth_in_n_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    if (log_rates) {
+      const auto rate_now = clock::now();
+      if (rate_now - rate_t0 >= rate_period) {
+        const double dt =
+          std::chrono::duration<double>(rate_now - rate_t0).count();
+        const double color_in =
+          static_cast<double>(color_in_n_.exchange(0, std::memory_order_relaxed)) / dt;
+        const double color_keep =
+          static_cast<double>(color_keep_n_.exchange(0, std::memory_order_relaxed)) / dt;
+        const double color_pub =
+          static_cast<double>(color_pub_n_.exchange(0, std::memory_order_relaxed)) / dt;
+        const double depth_in =
+          static_cast<double>(depth_in_n_.exchange(0, std::memory_order_relaxed)) / dt;
+        const double depth_pub =
+          static_cast<double>(depth_pub_n_.exchange(0, std::memory_order_relaxed)) / dt;
+        const double ir_in =
+          static_cast<double>(ir_in_n_.exchange(0, std::memory_order_relaxed)) / dt;
+        RCLCPP_INFO(
+          get_logger(),
+          "[sensor_rate] cam=%s  color_in=%.1fHz keep=%.1fHz pub=%.1fHz  "
+          "depth_in=%.1fHz pub=%.1fHz  ir_in=%.1fHz  "
+          "(cfg color %d→%.0f depth %d→%.0f ir %d) window=%.1fs",
+          camera_name_.c_str(),
+          color_in, color_keep, color_pub,
+          depth_in, depth_pub, ir_in,
+          color_fps_, color_publish_fps_,
+          depth_fps_, depth_publish_fps_,
+          infra_fps_, dt);
+        rate_t0 = rate_now;
+      }
+    }
+
     const auto deq_t0 = profile ? clock::now() : clock::time_point{};
 
     ++frame_id;
@@ -768,7 +926,24 @@ void StereoCompositeModularNode::color_worker()
     info.header = img.header;
     color_pub_->publish(img);
     color_info_pub_->publish(info);
+    color_pub_n_.fetch_add(1, std::memory_order_relaxed);
   }
+}
+
+void StereoCompositeModularNode::publish_color_slot(
+  sensor_msgs::msg::Image img, const rclcpp::Time & stamp)
+{
+  color_keep_n_.fetch_add(1, std::memory_order_relaxed);
+  img.header.stamp = stamp;
+  img.header.frame_id = color_optical_frame_;
+  {
+    std::lock_guard<std::mutex> lock(slot_.mu);
+    slot_.color_image = std::move(img);
+    slot_.color_stamp = stamp;
+    slot_.has_color = true;
+    ++slot_.color_seq;
+  }
+  slot_.cv_color.notify_one();
 }
 
 void StereoCompositeModularNode::depth_worker()
@@ -831,6 +1006,7 @@ void StereoCompositeModularNode::depth_worker()
     info.header = img.header;
     depth_pub_->publish(img);
     depth_info_pub_->publish(info);
+    depth_pub_n_.fetch_add(1, std::memory_order_relaxed);
 
     now = clock::now();
     do {
