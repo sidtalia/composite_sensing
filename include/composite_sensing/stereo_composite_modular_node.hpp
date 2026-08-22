@@ -109,6 +109,8 @@ private:
   std::string odom_topic_;
   std::string odom_frame_;
   std::string base_frame_;
+  /** 0 = every successful track. Else publish every round(infra_fps / hz)-th pose. */
+  double odom_publish_hz_{0.0};
   /** When false (default), odom is a measurement only — EKF owns odom→base TF. */
   bool publish_odom_tf_{false};
   bool apply_body_mount_{false};

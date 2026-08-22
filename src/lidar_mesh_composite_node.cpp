@@ -1,13 +1,14 @@
 #include "composite_sensing/lidar_mesh_composite_node.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <functional>
 #include <stdexcept>
 #include <utility>
 
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <tf2/LinearMath/Quaternion.h>
-#include <tf2/time.h>
 
 #include "composite_sensing/unilidar_lidar_device.hpp"
 #if defined(HOUND_HAVE_LIVOX_SDK) && HOUND_HAVE_LIVOX_SDK
@@ -123,10 +124,23 @@ void LidarMeshCompositeNode::declare_params()
   }
   deskew_reference_ = parse_deskew_reference(
     declare_parameter<std::string>("deskew.reference", "end"));
-  // 0 = fail-fast (no wait); waiting was inflating deskew wall time to ~timeout.
-  deskew_tf_timeout_s_ = declare_parameter<double>("deskew.tf_lookup_timeout_s", 0.0);
+  deskew_odom_topic_ = declare_parameter<std::string>(
+    "deskew.odom_topic", "/ekf/odometry");
   deskew_warn_ms_ = declare_parameter<double>("deskew.warn_ms", 40.0);
-  deskew_tf_buffer_s_ = declare_parameter<double>("deskew.tf_buffer_duration_s", 10.0);
+  deskew_pose_buffer_s_ = declare_parameter<double>("deskew.pose_buffer_s", 1.0);
+  {
+    const double wire_ms = std::max(
+      0.0, declare_parameter<double>("deskew.wire_latency_ms", 20.0));
+    deskew_wire_latency_ns_ =
+      static_cast<int64_t>(std::llround(wire_ms * 1e6));
+  }
+
+  // Assume base_link → lidar is fixed (rigid mount). T_base_lidar comes from
+  // SSoT lidar xyz/rpy, not from TF. Do not look this up per scan.
+  T_base_lidar_ = Eigen::Isometry3d::Identity();
+  T_base_lidar_.translation() = Eigen::Vector3d(t_x_, t_y_, t_z_);
+  T_base_lidar_.linear() =
+    Eigen::Quaterniond(q_w_, q_x_, q_y_, q_z_).normalized().toRotationMatrix();
 }
 
 void LidarMeshCompositeNode::start_pipeline()
@@ -168,12 +182,14 @@ void LidarMeshCompositeNode::start_pipeline()
   lcfg.temp_query_period_s = temp_query_period_s_;
   lidar_->open(lcfg);
 
-  tf_buffer_ = std::make_shared<tf2_ros::Buffer>(
-    get_clock(), tf2::durationFromSec(deskew_tf_buffer_s_));
-  tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
-
   static_tf_ = std::make_unique<tf2_ros::StaticTransformBroadcaster>(this);
   publish_static_lidar_tf();
+
+  if (deskew_enable_) {
+    odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+      deskew_odom_topic_, rclcpp::SensorDataQoS(),
+      std::bind(&LidarMeshCompositeNode::on_odom, this, std::placeholders::_1));
+  }
 
   if (publish_cloud_) {
     cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(cloud_topic_, 2);
@@ -197,12 +213,14 @@ void LidarMeshCompositeNode::start_pipeline()
   RCLCPP_INFO(
     get_logger(),
     "lidar_mesh_composite up: backend=%s lidar_ip=%s cloud=%s deskew=%s "
-    "motion_frame=%s (output=%s)",
+    "odom=%s motion_frame=%s wire_latency_ms=%.1f (output=%s)",
     lidar_backend_.c_str(),
     lidar_ip_.empty() ? "(n/a)" : lidar_ip_.c_str(),
     cloud_topic_.c_str(),
     deskew_enable_ ? "on" : "off",
+    deskew_odom_topic_.c_str(),
     deskew_motion_frame_.c_str(),
+    static_cast<double>(deskew_wire_latency_ns_) * 1e-6,
     lidar_frame_.c_str());
 }
 
@@ -350,6 +368,14 @@ void LidarMeshCompositeNode::capture_loop()
       saw_first_cloud = true;
       last_cloud_steady_ = now_tp;
       last_cloud_points_ = cloud.points.size();
+      // Header is host receive (flush ≈ scan end, minus intra-scan span).
+      // Subtract wire/SDK latency so stamp is photon time; deskew window
+      // then sits in the past of EKF odom instead of at host now.
+      if (deskew_wire_latency_ns_ > 0 &&
+        cloud.timestamp_ns > deskew_wire_latency_ns_)
+      {
+        cloud.timestamp_ns -= deskew_wire_latency_ns_;
+      }
       publish_temperatures();
 
       if (publish_raw_cloud_ && raw_cloud_pub_) {
@@ -357,10 +383,19 @@ void LidarMeshCompositeNode::capture_loop()
       }
 
       LidarFrame out = cloud;
-      if (deskew_enable_ && tf_buffer_) {
+      if (deskew_enable_) {
+        double max_off = 0.0;
+        for (const auto & p : cloud.points) {
+          if (std::isfinite(p.time_offset_s)) {
+            max_off = std::max(max_off, static_cast<double>(p.time_offset_s));
+          }
+        }
+        const int64_t end_ns =
+          cloud.timestamp_ns +
+          static_cast<int64_t>(std::llround(max_off * 1e9));
+        const auto poses = snapshot_odom_poses(cloud.timestamp_ns, end_ns);
         const DeskewResult dr = deskew_lidar_frame(
-          out, *tf_buffer_, deskew_motion_frame_, deskew_reference_,
-          deskew_tf_timeout_s_, get_logger(), *get_clock());
+          out, T_base_lidar_, poses, deskew_reference_);
         if (dr.ok) {
           if (dr.elapsed_ms >= deskew_warn_ms_) {
             RCLCPP_WARN(
@@ -369,7 +404,8 @@ void LidarMeshCompositeNode::capture_loop()
           }
           RCLCPP_INFO_THROTTLE(
             get_logger(), *get_clock(), 5000,
-            "deskew wall time: %.2f ms", dr.elapsed_ms);
+            "deskew wall time: %.2f ms poses=%zu",
+            dr.elapsed_ms, poses.size());
         } else {
           RCLCPP_WARN_THROTTLE(
             get_logger(), *get_clock(), 2000,
@@ -411,6 +447,74 @@ void LidarMeshCompositeNode::capture_loop()
       last_status_log_ = now_tp;
     }
   }
+}
+
+void LidarMeshCompositeNode::on_odom(
+  const nav_msgs::msg::Odometry::SharedPtr msg)
+{
+  if (!msg) {
+    return;
+  }
+  const std::string & parent = msg->header.frame_id;
+  const std::string & child = msg->child_frame_id;
+  if (parent != deskew_motion_frame_ || child != base_frame_) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 5000,
+      "deskew odom frames %s→%s (expected %s→%s); using pose anyway",
+      parent.c_str(), child.c_str(),
+      deskew_motion_frame_.c_str(), base_frame_.c_str());
+  }
+
+  StampedOdomPose sample;
+  sample.stamp_ns = rclcpp::Time(msg->header.stamp).nanoseconds();
+  if (sample.stamp_ns <= 0) {
+    return;
+  }
+  const auto & p = msg->pose.pose;
+  sample.T_odom_base = Eigen::Isometry3d::Identity();
+  sample.T_odom_base.translation() =
+    Eigen::Vector3d(p.position.x, p.position.y, p.position.z);
+  sample.T_odom_base.linear() =
+    Eigen::Quaterniond(
+      p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z)
+      .normalized()
+      .toRotationMatrix();
+
+  const int64_t keep_ns =
+    sample.stamp_ns -
+    static_cast<int64_t>(std::llround(deskew_pose_buffer_s_ * 1e9));
+  std::lock_guard<std::mutex> lock(odom_mu_);
+  if (!odom_poses_.empty() && sample.stamp_ns < odom_poses_.back().stamp_ns) {
+    return;
+  }
+  odom_poses_.push_back(std::move(sample));
+  while (!odom_poses_.empty() && odom_poses_.front().stamp_ns < keep_ns) {
+    odom_poses_.pop_front();
+  }
+}
+
+std::vector<StampedOdomPose> LidarMeshCompositeNode::snapshot_odom_poses(
+  int64_t start_ns, int64_t end_ns)
+{
+  std::lock_guard<std::mutex> lock(odom_mu_);
+  if (odom_poses_.empty()) {
+    return {};
+  }
+  // One sample on each side of [start_ns, end_ns] when available.
+  auto lo = std::lower_bound(
+    odom_poses_.begin(), odom_poses_.end(), start_ns,
+    [](const StampedOdomPose & p, int64_t t) { return p.stamp_ns < t; });
+  auto hi = std::upper_bound(
+    odom_poses_.begin(), odom_poses_.end(), end_ns,
+    [](int64_t t, const StampedOdomPose & p) { return t < p.stamp_ns; });
+  if (lo != odom_poses_.begin()) {
+    --lo;
+  }
+  if (hi != odom_poses_.end()) {
+    ++hi;  // include one sample after scan end
+  }
+  std::vector<StampedOdomPose> out(lo, hi);
+  return out;
 }
 
 }  // namespace composite_sensing

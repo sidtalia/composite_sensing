@@ -6,44 +6,34 @@
 
 #include <embree4/rtcore.h>
 
+#include "composite_sensing/assimp_mesh_load.hpp"
+#include "composite_sensing/mesh_raycaster.hpp"
+
 namespace composite_sensing
 {
 
-/** Triangle mesh accelerated with Embree 4 (CPU raycast). */
-struct EmbreeMeshMap
+/** Triangle mesh accelerated with Embree 4 (CPU packet raycast). */
+class EmbreeMeshMap : public MeshRaycaster
 {
-  RTCDevice device{nullptr};
-  RTCScene scene{nullptr};
-  std::vector<float> vertices;   // xyz xyz ...
-  std::vector<uint32_t> indices;  // triangles
-
+public:
   EmbreeMeshMap() = default;
   EmbreeMeshMap(const EmbreeMeshMap &) = delete;
   EmbreeMeshMap & operator=(const EmbreeMeshMap &) = delete;
 
-  ~EmbreeMeshMap()
-  {
-    if (scene) {
-      rtcReleaseScene(scene);
-      scene = nullptr;
-    }
-    if (device) {
-      rtcReleaseDevice(device);
-      device = nullptr;
-    }
-  }
+  ~EmbreeMeshMap() override;
 
-  /** Load with Assimp (dae/obj/ply/…). Throws on failure. */
+  static std::unique_ptr<EmbreeMeshMap> create(TriangleMesh mesh);
   static std::unique_ptr<EmbreeMeshMap> load(const std::string & path);
 
-  /**
-   * Raycast from origin along dir (must be unit). Returns hit distance or
-   * negative if miss. max_range clamps tfar.
-   */
-  float raycast(
-    float ox, float oy, float oz,
-    float dx, float dy, float dz,
-    float max_range) const;
+  const char * backend_name() const override { return "embree"; }
+  size_t triangle_count() const override { return indices_.size() / 3; }
+  void batchIntersect(const Ray * rays, Hit * hits, size_t n) override;
+
+private:
+  RTCDevice device_{nullptr};
+  RTCScene scene_{nullptr};
+  std::vector<float> vertices_;
+  std::vector<uint32_t> indices_;
 };
 
 }  // namespace composite_sensing

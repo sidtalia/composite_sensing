@@ -1,13 +1,7 @@
 #include "composite_sensing/embree_mesh_map.hpp"
 
 #include <algorithm>
-#include <cmath>
-#include <memory>
 #include <stdexcept>
-
-#include <assimp/Importer.hpp>
-#include <assimp/postprocess.h>
-#include <assimp/scene.h>
 
 namespace composite_sensing
 {
@@ -17,85 +11,22 @@ namespace
 
 void embree_error(void *, RTCError, const char * str)
 {
-  // Logged by caller if needed; keep quiet in hot path.
   (void)str;
 }
 
-}  // namespace
-
-std::unique_ptr<EmbreeMeshMap> EmbreeMeshMap::load(const std::string & path)
-{
-  Assimp::Importer importer;
-  const aiScene * scene = importer.ReadFile(
-    path,
-    aiProcess_Triangulate | aiProcess_JoinIdenticalVertices | aiProcess_PreTransformVertices);
-  if (!scene || !scene->mMeshes || scene->mNumMeshes == 0) {
-    throw std::runtime_error("EmbreeMeshMap: failed to load mesh: " + path);
-  }
-
-  auto map = std::make_unique<EmbreeMeshMap>();
-  for (unsigned m = 0; m < scene->mNumMeshes; ++m) {
-    const aiMesh * mesh = scene->mMeshes[m];
-    const uint32_t vbase = static_cast<uint32_t>(map->vertices.size() / 3);
-    for (unsigned i = 0; i < mesh->mNumVertices; ++i) {
-      map->vertices.push_back(mesh->mVertices[i].x);
-      map->vertices.push_back(mesh->mVertices[i].y);
-      map->vertices.push_back(mesh->mVertices[i].z);
-    }
-    for (unsigned f = 0; f < mesh->mNumFaces; ++f) {
-      const aiFace & face = mesh->mFaces[f];
-      if (face.mNumIndices != 3) {
-        continue;
-      }
-      map->indices.push_back(vbase + face.mIndices[0]);
-      map->indices.push_back(vbase + face.mIndices[1]);
-      map->indices.push_back(vbase + face.mIndices[2]);
-    }
-  }
-  if (map->indices.empty()) {
-    throw std::runtime_error("EmbreeMeshMap: no triangles in " + path);
-  }
-
-  map->device = rtcNewDevice(nullptr);
-  if (!map->device) {
-    throw std::runtime_error("EmbreeMeshMap: rtcNewDevice failed");
-  }
-  rtcSetDeviceErrorFunction(map->device, embree_error, nullptr);
-  map->scene = rtcNewScene(map->device);
-  RTCGeometry geom = rtcNewGeometry(map->device, RTC_GEOMETRY_TYPE_TRIANGLE);
-
-  float * vb = static_cast<float *>(rtcSetNewGeometryBuffer(
-      geom, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3,
-      3 * sizeof(float), map->vertices.size() / 3));
-  std::copy(map->vertices.begin(), map->vertices.end(), vb);
-
-  uint32_t * ib = static_cast<uint32_t *>(rtcSetNewGeometryBuffer(
-      geom, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT3,
-      3 * sizeof(uint32_t), map->indices.size() / 3));
-  std::copy(map->indices.begin(), map->indices.end(), ib);
-
-  rtcCommitGeometry(geom);
-  rtcAttachGeometry(map->scene, geom);
-  rtcReleaseGeometry(geom);
-  rtcCommitScene(map->scene);
-  return map;
-}
-
-float EmbreeMeshMap::raycast(
-  float ox, float oy, float oz,
-  float dx, float dy, float dz,
-  float max_range) const
+void intersect1(
+  RTCScene scene, const Ray & ray, Hit & hit)
 {
   RTCRayHit rh{};
-  rh.ray.org_x = ox;
-  rh.ray.org_y = oy;
-  rh.ray.org_z = oz;
-  rh.ray.dir_x = dx;
-  rh.ray.dir_y = dy;
-  rh.ray.dir_z = dz;
-  rh.ray.tnear = 0.0f;
-  rh.ray.tfar = max_range;
-  rh.ray.mask = -1;
+  rh.ray.org_x = ray.ox;
+  rh.ray.org_y = ray.oy;
+  rh.ray.org_z = ray.oz;
+  rh.ray.dir_x = ray.dx;
+  rh.ray.dir_y = ray.dy;
+  rh.ray.dir_z = ray.dz;
+  rh.ray.tnear = ray.tmin;
+  rh.ray.tfar = ray.tmax;
+  rh.ray.mask = static_cast<unsigned>(-1);
   rh.ray.flags = 0;
   rh.hit.geomID = RTC_INVALID_GEOMETRY_ID;
 
@@ -104,9 +35,110 @@ float EmbreeMeshMap::raycast(
   rtcIntersect1(scene, &rh, &args);
 
   if (rh.hit.geomID == RTC_INVALID_GEOMETRY_ID) {
-    return -1.0f;
+    hit.t = -1.0f;
+    hit.hit = 0;
+  } else {
+    hit.t = rh.ray.tfar;
+    hit.hit = 1;
   }
-  return rh.ray.tfar;
+}
+
+}  // namespace
+
+EmbreeMeshMap::~EmbreeMeshMap()
+{
+  if (scene_) {
+    rtcReleaseScene(scene_);
+    scene_ = nullptr;
+  }
+  if (device_) {
+    rtcReleaseDevice(device_);
+    device_ = nullptr;
+  }
+}
+
+std::unique_ptr<EmbreeMeshMap> EmbreeMeshMap::create(TriangleMesh mesh)
+{
+  if (mesh.indices.empty()) {
+    throw std::runtime_error("EmbreeMeshMap: no triangles");
+  }
+
+  auto map = std::make_unique<EmbreeMeshMap>();
+  map->vertices_ = std::move(mesh.vertices);
+  map->indices_ = std::move(mesh.indices);
+
+  map->device_ = rtcNewDevice(nullptr);
+  if (!map->device_) {
+    throw std::runtime_error("EmbreeMeshMap: rtcNewDevice failed");
+  }
+  rtcSetDeviceErrorFunction(map->device_, embree_error, nullptr);
+  map->scene_ = rtcNewScene(map->device_);
+  RTCGeometry geom = rtcNewGeometry(map->device_, RTC_GEOMETRY_TYPE_TRIANGLE);
+
+  float * vb = static_cast<float *>(rtcSetNewGeometryBuffer(
+      geom, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3,
+      3 * sizeof(float), map->vertices_.size() / 3));
+  std::copy(map->vertices_.begin(), map->vertices_.end(), vb);
+
+  uint32_t * ib = static_cast<uint32_t *>(rtcSetNewGeometryBuffer(
+      geom, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT3,
+      3 * sizeof(uint32_t), map->indices_.size() / 3));
+  std::copy(map->indices_.begin(), map->indices_.end(), ib);
+
+  rtcCommitGeometry(geom);
+  rtcAttachGeometry(map->scene_, geom);
+  rtcReleaseGeometry(geom);
+  rtcCommitScene(map->scene_);
+  return map;
+}
+
+std::unique_ptr<EmbreeMeshMap> EmbreeMeshMap::load(const std::string & path)
+{
+  return create(TriangleMesh::load(path));
+}
+
+void EmbreeMeshMap::batchIntersect(const Ray * rays, Hit * hits, size_t n)
+{
+  if (!scene_ || n == 0) {
+    return;
+  }
+
+  RTCIntersectArguments args;
+  rtcInitIntersectArguments(&args);
+
+  size_t i = 0;
+  for (; i + 4 <= n; i += 4) {
+    RTCRayHit4 rh{};
+    int valid[4] = {-1, -1, -1, -1};
+    for (int k = 0; k < 4; ++k) {
+      const Ray & r = rays[i + static_cast<size_t>(k)];
+      rh.ray.org_x[k] = r.ox;
+      rh.ray.org_y[k] = r.oy;
+      rh.ray.org_z[k] = r.oz;
+      rh.ray.dir_x[k] = r.dx;
+      rh.ray.dir_y[k] = r.dy;
+      rh.ray.dir_z[k] = r.dz;
+      rh.ray.tnear[k] = r.tmin;
+      rh.ray.tfar[k] = r.tmax;
+      rh.ray.mask[k] = static_cast<unsigned>(-1);
+      rh.ray.flags[k] = 0;
+      rh.hit.geomID[k] = RTC_INVALID_GEOMETRY_ID;
+    }
+    rtcIntersect4(valid, scene_, &rh, &args);
+    for (int k = 0; k < 4; ++k) {
+      Hit & h = hits[i + static_cast<size_t>(k)];
+      if (rh.hit.geomID[k] == RTC_INVALID_GEOMETRY_ID) {
+        h.t = -1.0f;
+        h.hit = 0;
+      } else {
+        h.t = rh.ray.tfar[k];
+        h.hit = 1;
+      }
+    }
+  }
+  for (; i < n; ++i) {
+    intersect1(scene_, rays[i], hits[i]);
+  }
 }
 
 }  // namespace composite_sensing

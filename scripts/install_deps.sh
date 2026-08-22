@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install / verify host deps for composite_sensing:
 #   - stereo: librealsense2 + cuVSLAM (Isaac or /opt/cuvslam)
-#   - lidar mesh PF: libembree-dev, libassimp-dev, unilidar_sdk (workspace)
+#   - lidar mesh PF: libembree-dev, libassimp-dev, libvulkan-dev, glslang-tools, unilidar_sdk
 #
 # Usage (inside mushr_jazzy / ROS Jazzy env):
 #   bash /root/colcon_ws/src/composite_sensing/scripts/install_deps.sh
@@ -68,6 +68,9 @@ install_apt_packages \
   libembree-dev \
   libassimp-dev \
   libeigen3-dev \
+  libvulkan-dev \
+  glslang-tools \
+  vulkan-tools \
   pkg-config \
   build-essential
 
@@ -99,7 +102,7 @@ else
   warn "  clone unilidar_sdk next to composite_sensing (expected under ${WS_SRC}/unilidar_sdk)"
 fi
 
-# --- Embree / Assimp verify --------------------------------------------------
+# --- Embree / Assimp / Vulkan verify -----------------------------------------
 if [[ -f /usr/include/embree4/rtcore.h || -f /usr/include/embree3/rtcore.h ]]; then
   log "Embree headers OK"
 else
@@ -109,6 +112,16 @@ if [[ -f /usr/include/assimp/Importer.hpp ]]; then
   log "Assimp headers OK"
 else
   err "Assimp headers missing after install (libassimp-dev)"
+fi
+if [[ -f /usr/include/vulkan/vulkan.h ]]; then
+  log "Vulkan headers OK"
+else
+  warn "Vulkan headers missing (libvulkan-dev) — mesh_pf will build Embree-only"
+fi
+if command -v glslangValidator >/dev/null 2>&1; then
+  log "glslangValidator OK: $(command -v glslangValidator)"
+else
+  warn "glslangValidator missing (glslang-tools) — mesh_pf will build Embree-only"
 fi
 
 # --- cuVSLAM -----------------------------------------------------------------

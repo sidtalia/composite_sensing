@@ -106,6 +106,7 @@ MeshPfNode::MeshPfNode(const rclcpp::NodeOptions & options)
   mcfg.localize_hz = localize_hz_;
   mcfg.global_init_on_start = global_init_on_start_;
   mcfg.init_bb = init_bb_;
+  mcfg.raycast_backend = raycast_backend_;
   pf->configure(mcfg);
   localizer_ = std::move(pf);
 
@@ -127,11 +128,15 @@ MeshPfNode::MeshPfNode(const rclcpp::NodeOptions & options)
       }
     });
 
+  const auto * pf_backend =
+    dynamic_cast<ConstantTwistMeshPfBackend *>(localizer_.get());
   RCLCPP_INFO(
     get_logger(),
-    "mesh_pf up: cloud=%s map=%s pose=%s hz=%.1f particles=%d",
+    "mesh_pf up: cloud=%s map=%s pose=%s hz=%.1f particles=%d backend=%s triangles=%zu",
     cloud_topic_.c_str(), map_file_.c_str(), pose_topic_.c_str(),
-    localize_hz_, num_particles_);
+    localize_hz_, num_particles_,
+    pf_backend ? pf_backend->raycast_backend_used().c_str() : "?",
+    pf_backend ? pf_backend->triangle_count() : 0ul);
 }
 
 void MeshPfNode::declare_params()
@@ -161,6 +166,7 @@ void MeshPfNode::declare_params()
   num_particles_ = declare_parameter<int>("num_particles", 2000);
   beam_samples_ = declare_parameter<int>("beam_samples", 64);
   global_init_on_start_ = declare_parameter<bool>("global_init_on_start", true);
+  raycast_backend_ = declare_parameter<std::string>("raycast_backend", "auto");
   init_bb_ = {
     declare_parameter<double>("init_bb.xmin", -20.0),
     declare_parameter<double>("init_bb.ymin", -20.0),

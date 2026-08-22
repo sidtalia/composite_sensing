@@ -22,7 +22,7 @@ find_package(OpenCV REQUIRED COMPONENTS core imgcodecs imgproc)
 
 include_directories(include)
 
-# Embree 4 (mesh PF raycast). Optional: skip lidar_mesh_composite if missing.
+# Embree 4 (mesh PF CPU raycast fallback). Optional Vulkan RT if present.
 find_library(EMBREE_LIB NAMES embree4 embree3)
 find_path(EMBREE_INCLUDE_DIR embree4/rtcore.h)
 if(NOT EMBREE_INCLUDE_DIR)
@@ -149,9 +149,9 @@ if(EXISTS "${UNITREE_SDK_LIB}")
     rclcpp
     sensor_msgs
     geometry_msgs
+    nav_msgs
     tf2
     tf2_ros
-    tf2_eigen
   )
   target_link_libraries(lidar_mesh_composite_node
     ${UNITREE_SDK_LIB}
@@ -167,20 +167,60 @@ else()
     "unitree=${UNITREE_SDK_LIB}")
 endif()
 
-# --- Standalone Embree mesh PF ------------------------------------------------
+# --- Standalone mesh PF (Embree CPU + optional Vulkan RT) ---------------------
 set(BUILD_MESH_PF OFF)
 if(EMBREE_LIB AND EMBREE_INCLUDE_DIR)
   set(BUILD_MESH_PF ON)
   message(STATUS "mesh_pf: embree=${EMBREE_LIB}")
+
+  find_package(Vulkan QUIET)
+  find_program(GLSLANG_VALIDATOR glslangValidator)
+  set(HAVE_VULKAN_RT OFF)
+  set(MESH_PF_VULKAN_SRCS)
+  set(MESH_PF_SPV_HEADER)
+  if(Vulkan_FOUND AND GLSLANG_VALIDATOR)
+    set(HAVE_VULKAN_RT ON)
+    set(MESH_PF_SPV_HEADER "${CMAKE_CURRENT_BINARY_DIR}/mesh_rayquery.spv.h")
+    add_custom_command(
+      OUTPUT "${MESH_PF_SPV_HEADER}"
+      COMMAND ${GLSLANG_VALIDATOR} -V
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/mesh_rayquery.comp"
+        --target-env vulkan1.2
+        --vn kMeshRayquerySpv
+        -o "${MESH_PF_SPV_HEADER}"
+      DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/mesh_rayquery.comp"
+      COMMENT "SPIR-V: mesh_rayquery.comp"
+      VERBATIM
+    )
+    list(APPEND MESH_PF_VULKAN_SRCS src/vulkan_mesh_raycaster.cpp)
+    set_source_files_properties(
+      src/vulkan_mesh_raycaster.cpp
+      PROPERTIES
+        OBJECT_DEPENDS "${MESH_PF_SPV_HEADER}"
+        COMPILE_FLAGS "-Wno-missing-field-initializers"
+    )
+    message(STATUS "mesh_pf: Vulkan RT enabled (${Vulkan_LIBRARY})")
+  else()
+    message(STATUS
+      "mesh_pf: Vulkan RT disabled "
+      "(Vulkan_FOUND=${Vulkan_FOUND} glslangValidator=${GLSLANG_VALIDATOR})")
+  endif()
+
   add_executable(mesh_pf_node
     src/mesh_pf_main.cpp
     src/mesh_pf_node.cpp
     src/constant_twist_mesh_pf_backend.cpp
+    src/assimp_mesh_load.cpp
     src/embree_mesh_map.cpp
+    src/mesh_raycaster.cpp
+    ${MESH_PF_VULKAN_SRCS}
   )
   target_include_directories(mesh_pf_node PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     ${EMBREE_INCLUDE_DIR}
+  )
+  target_include_directories(mesh_pf_node PRIVATE
+    ${CMAKE_CURRENT_BINARY_DIR}
   )
   ament_target_dependencies(mesh_pf_node
     rclcpp
@@ -193,7 +233,20 @@ if(EMBREE_LIB AND EMBREE_INCLUDE_DIR)
     ${EMBREE_LIB}
     assimp::assimp
   )
+  if(HAVE_VULKAN_RT)
+    target_compile_definitions(mesh_pf_node PRIVATE HOUND_HAVE_VULKAN_RT=1)
+    if(TARGET Vulkan::Vulkan)
+      target_link_libraries(mesh_pf_node Vulkan::Vulkan)
+    else()
+      target_include_directories(mesh_pf_node PRIVATE ${Vulkan_INCLUDE_DIRS})
+      target_link_libraries(mesh_pf_node ${Vulkan_LIBRARIES})
+    endif()
+  endif()
   target_compile_features(mesh_pf_node PUBLIC cxx_std_17)
+  if(HAVE_VULKAN_RT)
+    add_custom_target(mesh_pf_rayquery_spv DEPENDS "${MESH_PF_SPV_HEADER}")
+    add_dependencies(mesh_pf_node mesh_pf_rayquery_spv)
+  endif()
 else()
   message(WARNING
     "mesh_pf DISABLED (need libembree-dev). "

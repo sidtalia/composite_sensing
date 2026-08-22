@@ -42,6 +42,8 @@ struct MeshLocalizerConfig
   double dist_sigma_m{0.25};     // sensor model
   double max_ray_range_m{50.0};
   bool global_init_on_start{true};
+  /** "auto" (Vulkan RT then Embree), "vulkan", or "embree". */
+  std::string raycast_backend{"auto"};
 };
 
 /**

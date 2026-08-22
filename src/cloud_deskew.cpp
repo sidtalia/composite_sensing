@@ -4,17 +4,11 @@
 #include <chrono>
 #include <cmath>
 
-#include <geometry_msgs/msg/transform_stamped.hpp>
-#include <tf2/exceptions.h>
-#include <tf2_eigen/tf2_eigen.hpp>
-
 namespace composite_sensing
 {
 namespace
 {
 constexpr double kEpsilon = 1e-12;
-// Discrete pose bins so we slerp once per bin, not once per point.
-constexpr int kPoseBins = 32;
 
 Eigen::Isometry3d interpolateSE3(
   const Eigen::Isometry3d & T0,
@@ -31,32 +25,6 @@ Eigen::Isometry3d interpolateSE3(
   return T;
 }
 
-bool lookupEigenTransform(
-  tf2_ros::Buffer & tf_buffer,
-  const std::string & target_frame,
-  const std::string & source_frame,
-  const rclcpp::Time & time,
-  double timeout_s,
-  Eigen::Isometry3d & out,
-  const rclcpp::Logger & logger,
-  rclcpp::Clock & clock)
-{
-  try {
-    // timeout_s <= 0 → fail-fast (no wait for future TF).
-    const auto timeout = tf2::durationFromSec(std::max(0.0, timeout_s));
-    const geometry_msgs::msg::TransformStamped tf =
-      tf_buffer.lookupTransform(target_frame, source_frame, time, timeout);
-    out = tf2::transformToEigen(tf.transform);
-    return true;
-  } catch (const tf2::TransformException & ex) {
-    RCLCPP_WARN_THROTTLE(
-      logger, clock, 2000,
-      "deskew TF lookup failed (%s <- %s @ %.6f): %s",
-      target_frame.c_str(), source_frame.c_str(), time.seconds(), ex.what());
-    return false;
-  }
-}
-
 inline void applyIsometryFloat(
   const Eigen::Matrix3f & R, const Eigen::Vector3f & t, LidarPoint & p)
 {
@@ -65,31 +33,51 @@ inline void applyIsometryFloat(
   p.y = v.y();
   p.z = v.z();
 }
+
+/** Interpolate T_odom_base at stamp_ns. poses is sorted and covers stamp_ns. */
+Eigen::Isometry3d poseAt(
+  const std::vector<StampedOdomPose> & poses, int64_t stamp_ns)
+{
+  if (poses.size() == 1) {
+    return poses.front().T_odom_base;
+  }
+  auto it = std::lower_bound(
+    poses.begin(), poses.end(), stamp_ns,
+    [](const StampedOdomPose & p, int64_t t) { return p.stamp_ns < t; });
+  if (it == poses.begin()) {
+    return poses.front().T_odom_base;
+  }
+  if (it == poses.end()) {
+    return poses.back().T_odom_base;
+  }
+  const StampedOdomPose & b = *it;
+  const StampedOdomPose & a = *std::prev(it);
+  if (b.stamp_ns <= a.stamp_ns) {
+    return b.T_odom_base;
+  }
+  const double alpha =
+    static_cast<double>(stamp_ns - a.stamp_ns) /
+    static_cast<double>(b.stamp_ns - a.stamp_ns);
+  return interpolateSE3(a.T_odom_base, b.T_odom_base, alpha);
+}
+
 }  // namespace
 
 DeskewResult deskew_lidar_frame(
   LidarFrame & cloud,
-  tf2_ros::Buffer & tf_buffer,
-  const std::string & motion_frame,
-  DeskewReference reference,
-  double tf_lookup_timeout_s,
-  const rclcpp::Logger & logger,
-  rclcpp::Clock & clock)
+  const Eigen::Isometry3d & T_base_lidar,
+  const std::vector<StampedOdomPose> & odom_poses,
+  DeskewReference reference)
 {
   DeskewResult result;
   const auto t0 = std::chrono::steady_clock::now();
 
-  if (cloud.points.empty() || cloud.frame_id.empty() || motion_frame.empty()) {
-    result.error = "empty cloud or frame";
-    result.elapsed_ms = 0.0;
+  if (cloud.points.empty()) {
+    result.error = "empty cloud";
     return result;
   }
-
-  const std::string & lidar_frame = cloud.frame_id;
-  if (motion_frame == lidar_frame) {
-    result.error =
-      "motion_frame equals lidar_frame (no motion); set deskew.motion_frame=odom";
-    result.elapsed_ms = 0.0;
+  if (odom_poses.empty()) {
+    result.error = "no odom poses spanning scan";
     return result;
   }
 
@@ -100,50 +88,30 @@ DeskewResult deskew_lidar_frame(
     }
   }
 
-  const rclcpp::Time cloud_stamp(cloud.timestamp_ns, RCL_ROS_TIME);
-  const rclcpp::Time start_time = cloud_stamp;
-  const rclcpp::Time end_time(
-    cloud.timestamp_ns + static_cast<int64_t>(std::llround(max_offset_sec * 1e9)),
-    RCL_ROS_TIME);
-  const rclcpp::Time reference_time =
-    (reference == DeskewReference::Start) ? start_time : end_time;
+  const int64_t start_ns = cloud.timestamp_ns;
+  const int64_t end_ns =
+    start_ns + static_cast<int64_t>(std::llround(max_offset_sec * 1e9));
+  const int64_t ref_ns =
+    (reference == DeskewReference::Start) ? start_ns : end_ns;
 
-  // T_motion_lidar at scan bounds (needs odom→base + base→lidar in TF).
-  Eigen::Isometry3d T_start = Eigen::Isometry3d::Identity();
-  Eigen::Isometry3d T_end = Eigen::Isometry3d::Identity();
-
-  if (!lookupEigenTransform(
-        tf_buffer, motion_frame, lidar_frame, start_time, tf_lookup_timeout_s,
-        T_start, logger, clock))
+  if (odom_poses.front().stamp_ns > start_ns ||
+      odom_poses.back().stamp_ns < end_ns)
   {
-    result.error = "TF at scan start";
-    result.elapsed_ms = std::chrono::duration<double, std::milli>(
-      std::chrono::steady_clock::now() - t0).count();
-    return result;
-  }
-  if (max_offset_sec < kEpsilon) {
-    T_end = T_start;
-  } else if (!lookupEigenTransform(
-               tf_buffer, motion_frame, lidar_frame, end_time, tf_lookup_timeout_s,
-               T_end, logger, clock))
-  {
-    result.error = "TF at scan end";
+    result.error = "odom poses do not cover scan interval";
     result.elapsed_ms = std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - t0).count();
     return result;
   }
 
-  const Eigen::Isometry3d T_reference =
-    (reference == DeskewReference::Start) ? T_start : T_end;
-  const Eigen::Isometry3d T_reference_inv = T_reference.inverse();
-  // Warp into lidar frame at reference time: p_ref = (T_ref^{-1} T(t)) p
-  const Eigen::Isometry3d T0_rel = T_reference_inv * T_start;
-  const Eigen::Isometry3d T1_rel = T_reference_inv * T_end;
-  const double time_span = max_offset_sec;
+  const Eigen::Isometry3d T_ref =
+    poseAt(odom_poses, ref_ns) * T_base_lidar;
+  const Eigen::Isometry3d T_ref_inv = T_ref.inverse();
 
-  if (time_span < kEpsilon) {
-    const Eigen::Matrix3f R = T0_rel.linear().cast<float>();
-    const Eigen::Vector3f t = T0_rel.translation().cast<float>();
+  if (max_offset_sec < kEpsilon || odom_poses.size() == 1) {
+    const Eigen::Isometry3d T_rel =
+      T_ref_inv * (odom_poses.front().T_odom_base * T_base_lidar);
+    const Eigen::Matrix3f R = T_rel.linear().cast<float>();
+    const Eigen::Vector3f t = T_rel.translation().cast<float>();
     for (auto & p : cloud.points) {
       if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
         continue;
@@ -151,22 +119,6 @@ DeskewResult deskew_lidar_frame(
       applyIsometryFloat(R, t, p);
     }
   } else {
-    struct PoseBin
-    {
-      Eigen::Matrix3f R;
-      Eigen::Vector3f t;
-    };
-    PoseBin bins[kPoseBins];
-    for (int i = 0; i < kPoseBins; ++i) {
-      const double alpha =
-        (kPoseBins == 1) ? 0.0 : static_cast<double>(i) / static_cast<double>(kPoseBins - 1);
-      const Eigen::Isometry3d Ti = interpolateSE3(T0_rel, T1_rel, alpha);
-      bins[i].R = Ti.linear().cast<float>();
-      bins[i].t = Ti.translation().cast<float>();
-    }
-    const double inv_span = 1.0 / time_span;
-    const double bin_scale = static_cast<double>(kPoseBins - 1);
-
     for (auto & p : cloud.points) {
       if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
         continue;
@@ -174,16 +126,18 @@ DeskewResult deskew_lidar_frame(
       if (!std::isfinite(p.time_offset_s)) {
         continue;
       }
-      const double alpha = std::clamp(
-        static_cast<double>(p.time_offset_s) * inv_span, 0.0, 1.0);
-      const int bi = static_cast<int>(std::lround(alpha * bin_scale));
-      applyIsometryFloat(bins[bi].R, bins[bi].t, p);
+      const int64_t t_ns =
+        start_ns + static_cast<int64_t>(std::llround(
+          static_cast<double>(p.time_offset_s) * 1e9));
+      const Eigen::Isometry3d T_t =
+        poseAt(odom_poses, t_ns) * T_base_lidar;
+      const Eigen::Isometry3d T_rel = T_ref_inv * T_t;
+      applyIsometryFloat(
+        T_rel.linear().cast<float>(), T_rel.translation().cast<float>(), p);
     }
   }
 
-  // Stay in lidar frame; only the stamp moves to the reference instant.
-  cloud.timestamp_ns = reference_time.nanoseconds();
-
+  cloud.timestamp_ns = ref_ns;
   result.ok = true;
   result.elapsed_ms = std::chrono::duration<double, std::milli>(
     std::chrono::steady_clock::now() - t0).count();

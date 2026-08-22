@@ -2,17 +2,20 @@
 
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
+#include <Eigen/Geometry>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/temperature.hpp>
-#include <tf2_ros/buffer.h>
 #include <tf2_ros/static_transform_broadcaster.h>
-#include <tf2_ros/transform_listener.h>
 
 #include "composite_sensing/cloud_deskew.hpp"
 #include "composite_sensing/lidar_device.hpp"
@@ -41,6 +44,9 @@ private:
     const LidarFrame & cloud,
     const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr & pub);
   void publish_temperatures();
+  void on_odom(const nav_msgs::msg::Odometry::SharedPtr msg);
+  std::vector<StampedOdomPose> snapshot_odom_poses(
+    int64_t start_ns, int64_t end_ns);
 
   std::string lidar_backend_{"unitree"};
   std::string port_{"/dev/ttyUSB0"};
@@ -71,20 +77,26 @@ private:
 
   bool deskew_enable_{true};
   std::string deskew_motion_frame_{"odom"};
+  std::string deskew_odom_topic_{"/ekf/odometry"};
   DeskewReference deskew_reference_{DeskewReference::End};
-  double deskew_tf_timeout_s_{0.0};
   double deskew_warn_ms_{40.0};
-  double deskew_tf_buffer_s_{10.0};
+  double deskew_pose_buffer_s_{1.0};
+  int64_t deskew_wire_latency_ns_{0};
+
+  // Assume base_link → lidar is fixed (rigid mount). From SSoT xyz/rpy, not TF.
+  Eigen::Isometry3d T_base_lidar_{Eigen::Isometry3d::Identity()};
 
   std::unique_ptr<LidarDevice> lidar_;
-  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
-  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
   std::unique_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_;
 
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr raw_cloud_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Temperature>::SharedPtr core_temp_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Temperature>::SharedPtr environment_temp_pub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+
+  std::mutex odom_mu_;
+  std::deque<StampedOdomPose> odom_poses_;
 
   std::atomic<bool> running_{false};
   std::thread capture_thread_;

@@ -3,17 +3,18 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "composite_sensing/mesh_localizer_backend.hpp"
+#include "composite_sensing/mesh_raycaster.hpp"
 
 namespace composite_sensing
 {
 
-struct EmbreeMeshMap;
-
 /**
- * RMCL-style particle filter against a triangle mesh (Embree raycast).
+ * RMCL-style particle filter against a triangle mesh.
+ * Raycast backend is Vulkan RT when available, else Embree.
  * Motion model: constant twist estimated by differentiating the filter mean
  * (starts at 0). No external odom — safe to fuse pose into an EKF that already
  * consumes VSLAM/wheels.
@@ -28,6 +29,9 @@ public:
   void global_init() override;
   std::optional<PoseMap> localize(const LidarFrame & cloud) override;
 
+  const std::string & raycast_backend_used() const { return raycast_backend_used_; }
+  size_t triangle_count() const { return map_ ? map_->triangle_count() : 0; }
+
 private:
   struct Particle
   {
@@ -40,13 +44,20 @@ private:
   void sensor_update(const LidarFrame & cloud);
   void resample();
   PoseMap mean_pose() const;
-  double ray_error(
+
+  /** Fill ray + measured range for one particle / lidar sample. */
+  void fill_ray(
     double bx, double by, double bz, double byaw,
-    float px, float py, float pz) const;
+    float px, float py, float pz,
+    Ray & ray, float & meas) const;
 
   MeshLocalizerConfig cfg_{};
-  std::unique_ptr<EmbreeMeshMap> map_;
+  std::unique_ptr<MeshRaycaster> map_;
+  std::string raycast_backend_used_{"embree"};
   std::vector<Particle> particles_;
+  std::vector<Ray> rays_;
+  std::vector<Hit> hits_;
+  std::vector<float> meas_;
   mutable std::mutex mu_;
 
   bool have_mean_{false};

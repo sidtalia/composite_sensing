@@ -122,7 +122,8 @@ StereoCompositeModularNode::StereoCompositeModularNode(
   RCLCPP_INFO(
     get_logger(),
     "stereo_composite (modular): backend=%s serial=%s IR %dx%d@%d color=%s@%dHz(pub %.1f) "
-    "depth=%s%s vslam=%s odom_source=%s odom=%s child=%s publish_tf=%s mount=%s",
+    "depth=%s%s vslam=%s odom_source=%s odom=%s child=%s odom_pub_hz=%.1f "
+    "publish_tf=%s mount=%s",
     camera_backend_.c_str(), serial_number_.c_str(),
     infra_width_, infra_height_, infra_fps_,
     enable_color_ ? "on" : "off", color_fps_, color_publish_fps_,
@@ -132,6 +133,7 @@ StereoCompositeModularNode::StereoCompositeModularNode(
     odom_source_.c_str(),
     odom_topic_.c_str(),
     base_frame_.c_str(),
+    odom_publish_hz_,
     publish_odom_tf_ ? "true" : "false",
     apply_body_mount_ ? "body←cam" : "identity");
 }
@@ -192,6 +194,7 @@ void StereoCompositeModularNode::declare_params()
   initial_reset_ = declare_parameter<bool>("initial_reset", false);
   odom_topic_ = declare_parameter<std::string>(
     "odom_topic", "/visual_slam/tracking/odometry");
+  odom_publish_hz_ = declare_parameter<double>("odom_publish_hz", 0.0);
   odom_frame_ = declare_parameter<std::string>("odom_frame", "odom");
   base_frame_ = declare_parameter<std::string>("base_frame", "base_link");
   publish_odom_tf_ = declare_parameter<bool>("publish_odom_tf", false);
@@ -367,6 +370,14 @@ void StereoCompositeModularNode::capture_loop()
         static_cast<int>(std::lround(
           static_cast<double>(color_fps_) / color_publish_fps_)))
       : 1;
+  const int odom_stride =
+    (odom_publish_hz_ > 0.0 && infra_fps_ > 0)
+      ? std::max(
+        1,
+        static_cast<int>(std::lround(
+          static_cast<double>(infra_fps_) / odom_publish_hz_)))
+      : 1;
+  int odom_keep_n = 0;
   const int64_t color_period_ns =
     (color_publish_fps_ > 0.0)
       ? std::max<int64_t>(
@@ -741,30 +752,38 @@ void StereoCompositeModularNode::capture_loop()
       }
     }
 
+    const bool publish_this_odom =
+      (odom_stride <= 1) || ((++odom_keep_n % odom_stride) == 0);
+    rclcpp::Time ros_stamp{0, 0, RCL_ROS_TIME};
     {
       std::lock_guard<std::mutex> lock(slot_.mu);
-      slot_.pose = *pose_opt;
       // Dataset frames carry synthetic timestamps (frame_id / rate). Use them
       // so depth/odom/LocalMap stamps align 1:1 with dataset indices. Live
       // cameras keep host ROS time.
       if (camera_backend_ == "dataset" && timestamp_ns > 0) {
-        slot_.ros_stamp = rclcpp::Time(timestamp_ns, RCL_ROS_TIME);
+        ros_stamp = rclcpp::Time(timestamp_ns, RCL_ROS_TIME);
       } else {
-        slot_.ros_stamp = this->get_clock()->now();
+        ros_stamp = this->get_clock()->now();
       }
-      slot_.has_pose = true;
-      ++slot_.pose_seq;
-      slot_.has_gt = false;
-      if (have_gt) {
-        slot_.gt_pose = gt_pose;
-        slot_.has_gt = true;
+      if (publish_this_odom) {
+        slot_.pose = *pose_opt;
+        slot_.ros_stamp = ros_stamp;
+        slot_.has_pose = true;
+        ++slot_.pose_seq;
+        slot_.has_gt = false;
+        if (have_gt) {
+          slot_.gt_pose = gt_pose;
+          slot_.has_gt = true;
+        }
       }
       if (enable_depth_) {
-        slot_.stereo_stamp = slot_.ros_stamp;
+        slot_.stereo_stamp = publish_this_odom ? slot_.ros_stamp : ros_stamp;
         slot_.has_stereo_for_depth = true;
       }
     }
-    slot_.cv_pose.notify_one();
+    if (publish_this_odom) {
+      slot_.cv_pose.notify_one();
+    }
     if (enable_depth_) {
       slot_.cv_depth.notify_one();
     }

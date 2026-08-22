@@ -1,6 +1,6 @@
 #include "composite_sensing/constant_twist_mesh_pf_backend.hpp"
 
-#include "composite_sensing/embree_mesh_map.hpp"
+#include "composite_sensing/mesh_raycaster.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -48,8 +48,13 @@ void ConstantTwistMeshPfBackend::configure(const MeshLocalizerConfig & config)
   if (cfg_.map_file.empty()) {
     throw std::runtime_error("ConstantTwistMeshPfBackend: map_file required");
   }
-  map_ = EmbreeMeshMap::load(cfg_.map_file);
+  map_ = create_mesh_raycaster(cfg_.map_file, cfg_.raycast_backend, &raycast_backend_used_);
   particles_.assign(static_cast<size_t>(std::max(1, cfg_.num_particles)), {});
+  const size_t n_rays = particles_.size() *
+    static_cast<size_t>(std::max(1, cfg_.beam_samples));
+  rays_.assign(n_rays, {});
+  hits_.assign(n_rays, {});
+  meas_.assign(n_rays, 0.0f);
   have_mean_ = false;
   last_stamp_ns_ = 0;
   vx_ = vy_ = vz_ = wyaw_ = 0.0;
@@ -113,18 +118,16 @@ void ConstantTwistMeshPfBackend::motion_update(double dt)
   }
 }
 
-double ConstantTwistMeshPfBackend::ray_error(
+void ConstantTwistMeshPfBackend::fill_ray(
   double bx, double by, double bz, double byaw,
-  float px, float py, float pz) const
+  float px, float py, float pz,
+  Ray & ray, float & meas) const
 {
-  // Lidar point in base, then map.
-  double q_bl[4] = {
-    cfg_.q_base_lidar[0], cfg_.q_base_lidar[1],
-    cfg_.q_base_lidar[2], cfg_.q_base_lidar[3]};
-  // Rotate point by lidar quat in base (xyzw), then translate.
   const double lx = px, ly = py, lz = pz;
-  const double qx = q_bl[0], qy = q_bl[1], qz = q_bl[2], qw = q_bl[3];
-  // v' = q * v * q^{-1}
+  const double qx = cfg_.q_base_lidar[0];
+  const double qy = cfg_.q_base_lidar[1];
+  const double qz = cfg_.q_base_lidar[2];
+  const double qw = cfg_.q_base_lidar[3];
   const double tx = 2.0 * (qy * lz - qz * ly);
   const double ty = 2.0 * (qz * lx - qx * lz);
   const double tz = 2.0 * (qx * ly - qy * lx);
@@ -132,9 +135,9 @@ double ConstantTwistMeshPfBackend::ray_error(
   const double pby = ly + qw * ty + (qz * tx - qx * tz) + cfg_.t_base_lidar[1];
   const double pbz = lz + qw * tz + (qx * ty - qy * tx) + cfg_.t_base_lidar[2];
 
-  double ox_b = cfg_.t_base_lidar[0];
-  double oy_b = cfg_.t_base_lidar[1];
-  double oz_b = cfg_.t_base_lidar[2];
+  const double ox_b = cfg_.t_base_lidar[0];
+  const double oy_b = cfg_.t_base_lidar[1];
+  const double oz_b = cfg_.t_base_lidar[2];
 
   double ox_m, oy_m, px_m, py_m;
   rotate_yaw(byaw, ox_b, oy_b, ox_m, oy_m);
@@ -149,27 +152,26 @@ double ConstantTwistMeshPfBackend::ray_error(
   double dx = px_m - ox_m;
   double dy = py_m - oy_m;
   double dz = pz_m - oz_m;
-  const double meas = std::sqrt(dx * dx + dy * dy + dz * dz);
-  if (meas < 1e-3) {
-    return cfg_.dist_sigma_m * 4.0;
+  const double range = std::sqrt(dx * dx + dy * dy + dz * dz);
+  meas = static_cast<float>(range);
+  if (range >= 1e-3) {
+    dx /= range;
+    dy /= range;
+    dz /= range;
   }
-  dx /= meas;
-  dy /= meas;
-  dz /= meas;
-
-  const float sim = map_->raycast(
-    static_cast<float>(ox_m), static_cast<float>(oy_m), static_cast<float>(oz_m),
-    static_cast<float>(dx), static_cast<float>(dy), static_cast<float>(dz),
-    static_cast<float>(cfg_.max_ray_range_m));
-  if (sim < 0.0f) {
-    return cfg_.dist_sigma_m * 8.0;  // miss penalty
-  }
-  return std::abs(static_cast<double>(sim) - meas);
+  ray.ox = static_cast<float>(ox_m);
+  ray.oy = static_cast<float>(oy_m);
+  ray.oz = static_cast<float>(oz_m);
+  ray.tmin = 0.0f;
+  ray.dx = static_cast<float>(dx);
+  ray.dy = static_cast<float>(dy);
+  ray.dz = static_cast<float>(dz);
+  ray.tmax = static_cast<float>(cfg_.max_ray_range_m);
 }
 
 void ConstantTwistMeshPfBackend::sensor_update(const LidarFrame & cloud)
 {
-  if (!map_ || cloud.points.empty()) {
+  if (!map_ || cloud.points.empty() || particles_.empty()) {
     return;
   }
   const size_t n_samp = static_cast<size_t>(std::max(1, cfg_.beam_samples));
@@ -179,12 +181,39 @@ void ConstantTwistMeshPfBackend::sensor_update(const LidarFrame & cloud)
     idx[i] = pick(rng_);
   }
 
-  double wsum = 0.0;
-  for (auto & p : particles_) {
-    double err_acc = 0.0;
+  const size_t n_part = particles_.size();
+  const size_t n_rays = n_part * n_samp;
+  if (rays_.size() < n_rays) {
+    rays_.resize(n_rays);
+    hits_.resize(n_rays);
+    meas_.resize(n_rays);
+  }
+
+  size_t k = 0;
+  for (const auto & p : particles_) {
     for (size_t i : idx) {
       const auto & pt = cloud.points[i];
-      err_acc += ray_error(p.x, p.y, p.z, p.yaw, pt.x, pt.y, pt.z);
+      fill_ray(p.x, p.y, p.z, p.yaw, pt.x, pt.y, pt.z, rays_[k], meas_[k]);
+      ++k;
+    }
+  }
+
+  map_->batchIntersect(rays_.data(), hits_.data(), n_rays);
+
+  const double miss_pen = cfg_.dist_sigma_m * 8.0;
+  const double near_pen = cfg_.dist_sigma_m * 4.0;
+  double wsum = 0.0;
+  k = 0;
+  for (auto & p : particles_) {
+    double err_acc = 0.0;
+    for (size_t s = 0; s < n_samp; ++s, ++k) {
+      if (meas_[k] < 1e-3f) {
+        err_acc += near_pen;
+      } else if (hits_[k].hit == 0) {
+        err_acc += miss_pen;
+      } else {
+        err_acc += std::abs(static_cast<double>(hits_[k].t) - static_cast<double>(meas_[k]));
+      }
     }
     err_acc /= static_cast<double>(n_samp);
     const double like = std::exp(

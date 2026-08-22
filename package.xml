@@ -5,7 +5,7 @@
   <version>0.0.0</version>
   <description>
     Composite sensing: stereo+cuVSLAM and lidar SDK composite (in-process deskew).
-    Standalone Embree mesh particle filter (mesh_pf_node) for map-absolute pose.
+    Standalone mesh particle filter (mesh_pf_node): Vulkan RT or Embree.
   </description>
   <maintainer email="hound@todo.todo">hound</maintainer>
   <license>Apache-2.0</license>

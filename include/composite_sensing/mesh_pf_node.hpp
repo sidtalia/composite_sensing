@@ -15,7 +15,7 @@
 namespace composite_sensing
 {
 
-/** Standalone Embree constant-twist mesh particle filter. */
+/** Standalone constant-twist mesh particle filter (Vulkan RT / Embree). */
 class MeshPfNode : public rclcpp::Node
 {
 public:
@@ -31,6 +31,7 @@ private:
   std::string map_file_;
   std::string map_frame_{"map"};
   std::string base_frame_{"base_link"};
+  std::string raycast_backend_{"auto"};
   double t_x_{0}, t_y_{0}, t_z_{0.1};
   double q_x_{0}, q_y_{0}, q_z_{0}, q_w_{1};
   double localize_hz_{10.0};

@@ -1,0 +1,54 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_scalar_block_layout : enable
+
+layout(local_size_x = 64) in;
+
+struct Ray {
+  vec4 origin_tmin;
+  vec4 dir_tmax;
+};
+
+struct Hit {
+  float t;
+  uint hit;
+  uint pad0;
+  uint pad1;
+};
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT topLevelAS;
+layout(set = 0, binding = 1, std430) readonly buffer RayBuf { Ray rays[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer HitBuf { Hit hits[]; };
+layout(push_constant) uniform PC { uint count; } pc;
+
+void main()
+{
+  const uint i = gl_GlobalInvocationID.x;
+  if (i >= pc.count) {
+    return;
+  }
+
+  const Ray r = rays[i];
+  rayQueryEXT rq;
+  // Closest hit (do not use TerminateOnFirstHit).
+  rayQueryInitializeEXT(
+    rq,
+    topLevelAS,
+    gl_RayFlagsOpaqueEXT,
+    0xFFu,
+    r.origin_tmin.xyz,
+    r.origin_tmin.w,
+    r.dir_tmax.xyz,
+    r.dir_tmax.w);
+
+  while (rayQueryProceedEXT(rq)) {
+  }
+
+  if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+    hits[i].t = rayQueryGetIntersectionTEXT(rq, true);
+    hits[i].hit = 1u;
+  } else {
+    hits[i].t = -1.0;
+    hits[i].hit = 0u;
+  }
+}
