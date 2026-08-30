@@ -3,6 +3,7 @@
 #include "composite_sensing/mesh_raycaster.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <stdexcept>
 
@@ -174,6 +175,11 @@ void ConstantTwistMeshPfBackend::sensor_update(const LidarFrame & cloud)
   if (!map_ || cloud.points.empty() || particles_.empty()) {
     return;
   }
+  using Clock = std::chrono::steady_clock;
+  const auto ms = [](Clock::time_point a, Clock::time_point b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+  };
+
   const size_t n_samp = static_cast<size_t>(std::max(1, cfg_.beam_samples));
   std::vector<size_t> idx(n_samp);
   std::uniform_int_distribution<size_t> pick(0, cloud.points.size() - 1);
@@ -189,6 +195,7 @@ void ConstantTwistMeshPfBackend::sensor_update(const LidarFrame & cloud)
     meas_.resize(n_rays);
   }
 
+  const auto t_fill0 = Clock::now();
   size_t k = 0;
   for (const auto & p : particles_) {
     for (size_t i : idx) {
@@ -197,8 +204,13 @@ void ConstantTwistMeshPfBackend::sensor_update(const LidarFrame & cloud)
       ++k;
     }
   }
-
+  const auto t_cast0 = Clock::now();
   map_->batchIntersect(rays_.data(), hits_.data(), n_rays);
+  const auto t_cast1 = Clock::now();
+
+  last_timing_.fill_ms = ms(t_fill0, t_cast0);
+  last_timing_.raycast_ms = ms(t_cast0, t_cast1);
+  last_timing_.n_rays = n_rays;
 
   const double miss_pen = cfg_.dist_sigma_m * 8.0;
   const double near_pen = cfg_.dist_sigma_m * 4.0;
@@ -227,11 +239,12 @@ void ConstantTwistMeshPfBackend::sensor_update(const LidarFrame & cloud)
     for (auto & p : particles_) {
       p.weight = u;
     }
-    return;
+  } else {
+    for (auto & p : particles_) {
+      p.weight /= wsum;
+    }
   }
-  for (auto & p : particles_) {
-    p.weight /= wsum;
-  }
+  last_timing_.weight_ms = ms(t_cast1, Clock::now());
 }
 
 void ConstantTwistMeshPfBackend::resample()
@@ -301,6 +314,7 @@ std::optional<PoseMap> ConstantTwistMeshPfBackend::localize(const LidarFrame & c
     return std::nullopt;
   }
 
+  const auto t0 = std::chrono::steady_clock::now();
   double dt = 1.0 / std::max(1.0, cfg_.localize_hz);
   if (last_stamp_ns_ > 0 && cloud.timestamp_ns > last_stamp_ns_) {
     dt = static_cast<double>(cloud.timestamp_ns - last_stamp_ns_) * 1e-9;
@@ -331,6 +345,8 @@ std::optional<PoseMap> ConstantTwistMeshPfBackend::localize(const LidarFrame & c
   last_mean_ = mean;
   have_mean_ = true;
   last_stamp_ns_ = cloud.timestamp_ns;
+  last_timing_.localize_ms = std::chrono::duration<double, std::milli>(
+    std::chrono::steady_clock::now() - t0).count();
   return mean;
 }
 

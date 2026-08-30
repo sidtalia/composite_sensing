@@ -62,11 +62,16 @@ std::unique_ptr<MeshRaycaster> create_mesh_raycaster(
     }
   }
 #else
+  if (try_vk) {
+    std::fprintf(
+      stderr,
+      "[mesh_pf] Vulkan RT not compiled in "
+      "(need libvulkan-dev + glslangValidator at cmake time); using Embree\n");
+  }
   if (force_vk) {
     throw std::runtime_error(
       "Vulkan RT not built into mesh_pf (need libvulkan-dev and glslangValidator)");
   }
-  (void)try_vk;
 #endif
 
   auto cpu = EmbreeMeshMap::create(std::move(mesh));

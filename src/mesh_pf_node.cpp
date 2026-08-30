@@ -5,8 +5,11 @@
 #include <memory>
 #include <stdexcept>
 
+#include <geometry_msgs/msg/transform_stamped.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <tf2/LinearMath/Quaternion.h>
+#include <tf2/LinearMath/Transform.h>
+#include <tf2/exceptions.h>
 
 #include "composite_sensing/constant_twist_mesh_pf_backend.hpp"
 #include "composite_sensing/lidar_device.hpp"
@@ -110,6 +113,12 @@ MeshPfNode::MeshPfNode(const rclcpp::NodeOptions & options)
   pf->configure(mcfg);
   localizer_ = std::move(pf);
 
+  if (publish_tf_) {
+    tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
+    tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_);
+    tf_static_ = std::make_unique<tf2_ros::StaticTransformBroadcaster>(*this);
+  }
+
   pose_pub_ = create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
     pose_topic_, 10);
   cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
@@ -132,11 +141,14 @@ MeshPfNode::MeshPfNode(const rclcpp::NodeOptions & options)
     dynamic_cast<ConstantTwistMeshPfBackend *>(localizer_.get());
   RCLCPP_INFO(
     get_logger(),
-    "mesh_pf up: cloud=%s map=%s pose=%s hz=%.1f particles=%d backend=%s triangles=%zu",
+    "mesh_pf up: cloud=%s map=%s pose=%s hz=%.1f particles=%d backend=%s "
+    "triangles=%zu tf=%s→%s%s",
     cloud_topic_.c_str(), map_file_.c_str(), pose_topic_.c_str(),
     localize_hz_, num_particles_,
     pf_backend ? pf_backend->raycast_backend_used().c_str() : "?",
-    pf_backend ? pf_backend->triangle_count() : 0ul);
+    pf_backend ? pf_backend->triangle_count() : 0ul,
+    map_frame_.c_str(), odom_frame_.c_str(),
+    publish_tf_ ? " /tf_static" : " (off)");
 }
 
 void MeshPfNode::declare_params()
@@ -146,7 +158,9 @@ void MeshPfNode::declare_params()
     "pose_topic", "/localization/mesh_pose");
   map_file_ = declare_parameter<std::string>("map_file", "");
   map_frame_ = declare_parameter<std::string>("map_frame", "map");
+  odom_frame_ = declare_parameter<std::string>("odom_frame", "odom");
   base_frame_ = declare_parameter<std::string>("base_frame", "base_link");
+  publish_tf_ = declare_parameter<bool>("publish_tf", true);
   t_x_ = declare_parameter<double>("xyz.x", 0.0);
   t_y_ = declare_parameter<double>("xyz.y", 0.0);
   t_z_ = declare_parameter<double>("xyz.z", 0.1);
@@ -198,8 +212,21 @@ void MeshPfNode::cloud_callback(const sensor_msgs::msg::PointCloud2::SharedPtr m
     return;
   }
   auto pose = localizer_->localize(cloud);
+  if (const auto * pf_backend =
+        dynamic_cast<ConstantTwistMeshPfBackend *>(localizer_.get()))
+  {
+    const auto t = pf_backend->last_timing();
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "mesh_pf infer: raycast=%.2fms fill=%.2fms weight=%.2fms "
+      "localize=%.2fms rays=%zu backend=%s",
+      t.raycast_ms, t.fill_ms, t.weight_ms, t.localize_ms, t.n_rays,
+      pf_backend->raycast_backend_used().c_str());
+  }
   if (pose && pose->valid) {
-    publish_pose(*pose, rclcpp::Time(msg->header.stamp));
+    const rclcpp::Time stamp(msg->header.stamp);
+    publish_pose(*pose, stamp);
+    publish_map_odom(*pose, stamp);
   }
 }
 
@@ -224,6 +251,55 @@ void MeshPfNode::publish_pose(const PoseMap & pose, const rclcpp::Time & stamp)
   msg.pose.covariance[14] = v;
   msg.pose.covariance[35] = 0.25;
   pose_pub_->publish(msg);
+}
+
+void MeshPfNode::publish_map_odom(const PoseMap & pose, const rclcpp::Time & stamp)
+{
+  if (!publish_tf_ || !tf_buffer_ || !tf_static_) {
+    return;
+  }
+  geometry_msgs::msg::TransformStamped odom_base;
+  try {
+    odom_base = tf_buffer_->lookupTransform(
+      odom_frame_, base_frame_, stamp, rclcpp::Duration::from_seconds(0.05));
+  } catch (const tf2::TransformException &) {
+    try {
+      odom_base = tf_buffer_->lookupTransform(
+        odom_frame_, base_frame_, tf2::TimePointZero);
+    } catch (const tf2::TransformException & ex) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "mesh_pf: no %s←%s for map←odom (%s)",
+        odom_frame_.c_str(), base_frame_.c_str(), ex.what());
+      return;
+    }
+  }
+
+  const tf2::Transform T_map_base(
+    tf2::Quaternion(
+      pose.rotation[0], pose.rotation[1], pose.rotation[2], pose.rotation[3]),
+    tf2::Vector3(
+      pose.translation[0], pose.translation[1], pose.translation[2]));
+  const auto & t = odom_base.transform;
+  const tf2::Transform T_odom_base(
+    tf2::Quaternion(t.rotation.x, t.rotation.y, t.rotation.z, t.rotation.w),
+    tf2::Vector3(t.translation.x, t.translation.y, t.translation.z));
+  const tf2::Transform T_map_odom = T_map_base * T_odom_base.inverse();
+
+  geometry_msgs::msg::TransformStamped out;
+  out.header.stamp = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+  out.header.frame_id = map_frame_;
+  out.child_frame_id = odom_frame_;
+  const tf2::Vector3 p = T_map_odom.getOrigin();
+  const tf2::Quaternion q = T_map_odom.getRotation();
+  out.transform.translation.x = p.x();
+  out.transform.translation.y = p.y();
+  out.transform.translation.z = p.z();
+  out.transform.rotation.x = q.x();
+  out.transform.rotation.y = q.y();
+  out.transform.rotation.z = q.z();
+  out.transform.rotation.w = q.w();
+  tf_static_->sendTransform(out);
 }
 
 }  // namespace composite_sensing

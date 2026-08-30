@@ -159,6 +159,13 @@ if(EXISTS "${UNITREE_SDK_LIB}")
   )
   if(HAVE_LIVOX_SDK)
     target_link_libraries(lidar_mesh_composite_node ${LIVOX_SDK_LIB} pthread)
+    # Livox vendors spdlog. Static-linking it into this executable exports
+    # weak spdlog symbols that interpose ROS rcl_logging_spdlog and abort at
+    # rclcpp::init (~periodic_worker mutex EINVAL / "Invalid argument").
+    if(LIVOX_SDK_LIB MATCHES "\\.a$")
+      target_link_options(lidar_mesh_composite_node PRIVATE
+        "LINKER:--exclude-libs,liblivox_lidar_sdk_static.a")
+    endif()
   endif()
   target_compile_features(lidar_mesh_composite_node PUBLIC cxx_std_17)
 else()
@@ -228,6 +235,7 @@ if(EMBREE_LIB AND EMBREE_INCLUDE_DIR)
     geometry_msgs
     std_srvs
     tf2
+    tf2_ros
   )
   target_link_libraries(mesh_pf_node
     ${EMBREE_LIB}

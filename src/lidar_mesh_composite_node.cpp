@@ -97,6 +97,18 @@ void LidarMeshCompositeNode::declare_params()
   cloud_scan_num_ = declare_parameter<int>("cloud_scan_num", 18);
   publish_cloud_ = declare_parameter<bool>("publish_cloud", true);
   cloud_topic_ = declare_parameter<std::string>("cloud_topic", "/unilidar/cloud");
+  enable_imu_ = declare_parameter<bool>("enable_imu", false);
+  imu_frame_ = declare_parameter<std::string>("imu_frame", "livox_imu");
+  imu_topic_ = declare_parameter<std::string>("imu_topic", "/livox/imu");
+  imu_x_ = declare_parameter<double>("imu_xyz.x", 0.011);
+  imu_y_ = declare_parameter<double>("imu_xyz.y", 0.02329);
+  imu_z_ = declare_parameter<double>("imu_xyz.z", -0.04412);
+  {
+    const double r = declare_parameter<double>("imu_rpy.roll", 0.0);
+    const double p = declare_parameter<double>("imu_rpy.pitch", 0.0);
+    const double y = declare_parameter<double>("imu_rpy.yaw", 0.0);
+    rpy_deg_to_quat(r, p, y, imu_qx_, imu_qy_, imu_qz_, imu_qw_);
+  }
   publish_raw_cloud_ = declare_parameter<bool>("publish_raw_cloud", false);
   raw_cloud_topic_ = declare_parameter<std::string>("raw_cloud_topic", "/livox/cloud_raw");
   core_temp_topic_ = declare_parameter<std::string>(
@@ -180,6 +192,7 @@ void LidarMeshCompositeNode::start_pipeline()
   lcfg.config_path = config_path_;
   lcfg.frame_time_ms = frame_time_ms_;
   lcfg.temp_query_period_s = temp_query_period_s_;
+  lcfg.enable_imu = enable_imu_;
   lidar_->open(lcfg);
 
   static_tf_ = std::make_unique<tf2_ros::StaticTransformBroadcaster>(this);
@@ -198,6 +211,10 @@ void LidarMeshCompositeNode::start_pipeline()
     raw_cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
       raw_cloud_topic_, 2);
   }
+  if (enable_imu_ && !imu_topic_.empty()) {
+    imu_pub_ = create_publisher<sensor_msgs::msg::Imu>(
+      imu_topic_, rclcpp::SensorDataQoS());
+  }
   if (!core_temp_topic_.empty()) {
     core_temp_pub_ = create_publisher<sensor_msgs::msg::Temperature>(
       core_temp_topic_, 10);
@@ -212,11 +229,12 @@ void LidarMeshCompositeNode::start_pipeline()
 
   RCLCPP_INFO(
     get_logger(),
-    "lidar_mesh_composite up: backend=%s lidar_ip=%s cloud=%s deskew=%s "
+    "lidar_mesh_composite up: backend=%s lidar_ip=%s cloud=%s imu=%s deskew=%s "
     "odom=%s motion_frame=%s wire_latency_ms=%.1f (output=%s)",
     lidar_backend_.c_str(),
     lidar_ip_.empty() ? "(n/a)" : lidar_ip_.c_str(),
     cloud_topic_.c_str(),
+    enable_imu_ ? imu_topic_.c_str() : "off",
     deskew_enable_ ? "on" : "off",
     deskew_odom_topic_.c_str(),
     deskew_motion_frame_.c_str(),
@@ -226,6 +244,7 @@ void LidarMeshCompositeNode::start_pipeline()
 
 void LidarMeshCompositeNode::publish_static_lidar_tf()
 {
+  std::vector<geometry_msgs::msg::TransformStamped> tfs;
   geometry_msgs::msg::TransformStamped tf;
   tf.header.stamp = now();
   tf.header.frame_id = parent_frame_;
@@ -237,7 +256,46 @@ void LidarMeshCompositeNode::publish_static_lidar_tf()
   tf.transform.rotation.y = q_y_;
   tf.transform.rotation.z = q_z_;
   tf.transform.rotation.w = q_w_;
-  static_tf_->sendTransform(tf);
+  tfs.push_back(tf);
+
+  if (enable_imu_ && imu_frame_ != lidar_frame_) {
+    geometry_msgs::msg::TransformStamped imu_tf;
+    imu_tf.header.stamp = tf.header.stamp;
+    imu_tf.header.frame_id = lidar_frame_;
+    imu_tf.child_frame_id = imu_frame_;
+    imu_tf.transform.translation.x = imu_x_;
+    imu_tf.transform.translation.y = imu_y_;
+    imu_tf.transform.translation.z = imu_z_;
+    imu_tf.transform.rotation.x = imu_qx_;
+    imu_tf.transform.rotation.y = imu_qy_;
+    imu_tf.transform.rotation.z = imu_qz_;
+    imu_tf.transform.rotation.w = imu_qw_;
+    tfs.push_back(imu_tf);
+  }
+  static_tf_->sendTransform(tfs);
+}
+
+void LidarMeshCompositeNode::publish_imu()
+{
+  if (!lidar_ || !imu_pub_) {
+    return;
+  }
+  std::vector<LidarImuSample> samples;
+  lidar_->drain_imu(samples);
+  for (const auto & s : samples) {
+    sensor_msgs::msg::Imu msg;
+    msg.header.stamp = rclcpp::Time(s.timestamp_ns);
+    msg.header.frame_id = imu_frame_;
+    msg.orientation.w = 1.0;
+    msg.orientation_covariance[0] = -1.0;
+    msg.angular_velocity.x = s.gx;
+    msg.angular_velocity.y = s.gy;
+    msg.angular_velocity.z = s.gz;
+    msg.linear_acceleration.x = s.ax;
+    msg.linear_acceleration.y = s.ay;
+    msg.linear_acceleration.z = s.az;
+    imu_pub_->publish(msg);
+  }
 }
 
 void LidarMeshCompositeNode::publish_cloud(
@@ -341,7 +399,10 @@ void LidarMeshCompositeNode::capture_loop()
     const auto now_tp = std::chrono::steady_clock::now();
 
     LidarFrame cloud;
-    if (!lidar_->wait_cloud(cloud, 200)) {
+    publish_imu();
+    const int wait_ms = enable_imu_ ? 20 : 200;
+    if (!lidar_->wait_cloud(cloud, wait_ms)) {
+      publish_imu();
       publish_temperatures();
       if (cloud_stale_warn_s_ > 0.0 &&
           (now_tp - last_cloud_steady_) >=
@@ -368,6 +429,7 @@ void LidarMeshCompositeNode::capture_loop()
       saw_first_cloud = true;
       last_cloud_steady_ = now_tp;
       last_cloud_points_ = cloud.points.size();
+      publish_imu();
       // Header is host receive (flush ≈ scan end, minus intra-scan span).
       // Subtract wire/SDK latency so stamp is photon time; deskew window
       // then sits in the past of EKF odom instead of at host now.

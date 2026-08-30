@@ -116,12 +116,12 @@ fi
 if [[ -f /usr/include/vulkan/vulkan.h ]]; then
   log "Vulkan headers OK"
 else
-  warn "Vulkan headers missing (libvulkan-dev) — mesh_pf will build Embree-only"
+  err "Vulkan headers missing (libvulkan-dev) — mesh_pf would build Embree-only"
 fi
 if command -v glslangValidator >/dev/null 2>&1; then
   log "glslangValidator OK: $(command -v glslangValidator)"
 else
-  warn "glslangValidator missing (glslang-tools) — mesh_pf will build Embree-only"
+  err "glslangValidator missing (glslang-tools) — mesh_pf would build Embree-only"
 fi
 
 # --- cuVSLAM -----------------------------------------------------------------

@@ -10,6 +10,7 @@
 #include <rclcpp/qos.hpp>
 
 #include "composite_sensing/color_sync_shm.hpp"
+#include "composite_sensing/color_undistort.hpp"
 #include "composite_sensing/cuvslam_backend.hpp"
 #include "composite_sensing/dataset_camera_device.hpp"
 #include "composite_sensing/frame_conventions.hpp"
@@ -122,8 +123,8 @@ StereoCompositeModularNode::StereoCompositeModularNode(
   RCLCPP_INFO(
     get_logger(),
     "stereo_composite (modular): backend=%s serial=%s IR %dx%d@%d color=%s@%dHz(pub %.1f) "
-    "depth=%s%s vslam=%s odom_source=%s odom=%s child=%s odom_pub_hz=%.1f "
-    "publish_tf=%s mount=%s",
+    "depth=%s%s vslam=%s odom_source=%s odom=%s child=%s "
+    "odom_pub_hz=%.1f publish_tf=%s mount=%s",
     camera_backend_.c_str(), serial_number_.c_str(),
     infra_width_, infra_height_, infra_fps_,
     enable_color_ ? "on" : "off", color_fps_, color_publish_fps_,
@@ -305,6 +306,23 @@ void StereoCompositeModularNode::start_pipeline()
       depth_camera_info_.header.frame_id = depth_optical_frame_;
     }
     camera_ = std::move(cam);
+  }
+
+  if (enable_color_) {
+    if (color_undistort_.init(color_camera_info_)) {
+      RCLCPP_INFO(
+        get_logger(),
+        "color undistort: %s %dx%d → pinhole K (D=0) on /%s/color/image_raw "
+        "(published frames only)",
+        color_camera_info_.distortion_model.c_str(),
+        color_camera_info_.width, color_camera_info_.height,
+        camera_name_.c_str());
+    } else {
+      RCLCPP_WARN(
+        get_logger(),
+        "color undistort skipped for %s (no usable D); publishing factory color",
+        camera_name_.c_str());
+    }
   }
 
   if (enable_vslam_) {
@@ -941,10 +959,18 @@ void StereoCompositeModularNode::color_worker()
       img = slot_.color_image;
     }
 
-    auto info = color_camera_info_;
-    info.header = img.header;
-    color_pub_->publish(img);
-    color_info_pub_->publish(info);
+    if (color_undistort_.ready()) {
+      color_undistort_.apply(&img);
+      auto info = color_undistort_.pinhole_info();
+      info.header = img.header;
+      color_pub_->publish(img);
+      color_info_pub_->publish(info);
+    } else {
+      auto info = color_camera_info_;
+      info.header = img.header;
+      color_pub_->publish(img);
+      color_info_pub_->publish(info);
+    }
     color_pub_n_.fetch_add(1, std::memory_order_relaxed);
   }
 }

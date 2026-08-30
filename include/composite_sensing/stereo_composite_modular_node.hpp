@@ -20,6 +20,7 @@
 
 #include "composite_sensing/camera_device.hpp"
 #include "composite_sensing/color_sync_shm.hpp"
+#include "composite_sensing/color_undistort.hpp"
 #include "composite_sensing/dataset_camera_device.hpp"
 #include "composite_sensing/realsense_camera_device.hpp"
 #include "composite_sensing/vslam_backend.hpp"
@@ -148,6 +149,7 @@ private:
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr gt_odom_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr color_pub_;
   rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr color_info_pub_;
+  ColorUndistorter color_undistort_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr depth_pub_;
   rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr depth_info_pub_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;

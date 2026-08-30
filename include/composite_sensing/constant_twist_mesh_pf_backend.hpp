@@ -32,6 +32,17 @@ public:
   const std::string & raycast_backend_used() const { return raycast_backend_used_; }
   size_t triangle_count() const { return map_ ? map_->triangle_count() : 0; }
 
+  /** Last localize() wall times (ms). Raycast is the mesh matcher. */
+  struct Timing
+  {
+    double fill_ms{0};
+    double raycast_ms{0};
+    double weight_ms{0};
+    double localize_ms{0};
+    size_t n_rays{0};
+  };
+  Timing last_timing() const { return last_timing_; }
+
 private:
   struct Particle
   {
@@ -66,6 +77,7 @@ private:
   double vx_{0}, vy_{0}, vz_{0}, wyaw_{0};
 
   std::mt19937 rng_{std::random_device{}()};
+  Timing last_timing_{};
 };
 
 }  // namespace composite_sensing

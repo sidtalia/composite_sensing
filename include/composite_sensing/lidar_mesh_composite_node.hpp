@@ -13,6 +13,7 @@
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/temperature.hpp>
 #include <tf2_ros/static_transform_broadcaster.h>
@@ -40,6 +41,7 @@ private:
   void start_pipeline();
   void capture_loop();
   void publish_static_lidar_tf();
+  void publish_imu();
   void publish_cloud(
     const LidarFrame & cloud,
     const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr & pub);
@@ -66,6 +68,11 @@ private:
   int cloud_scan_num_{18};
   bool publish_cloud_{true};
   std::string cloud_topic_{"/unilidar/cloud"};
+  bool enable_imu_{false};
+  std::string imu_frame_{"livox_imu"};
+  std::string imu_topic_{"/livox/imu"};
+  double imu_x_{0.011}, imu_y_{0.02329}, imu_z_{-0.04412};
+  double imu_qx_{0}, imu_qy_{0}, imu_qz_{0}, imu_qw_{1};
   bool publish_raw_cloud_{false};
   std::string raw_cloud_topic_{"/livox/cloud_raw"};
   std::string core_temp_topic_{"/livox/core_temp"};
@@ -91,6 +98,7 @@ private:
 
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr raw_cloud_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Temperature>::SharedPtr core_temp_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Temperature>::SharedPtr environment_temp_pub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;

@@ -84,6 +84,16 @@ void LivoxLidarDevice::PointCloudCallback(
   }
 }
 
+void LivoxLidarDevice::ImuDataCallback(
+  uint32_t /*handle*/, const uint8_t /*dev_type*/,
+  LivoxLidarEthernetPacket * data, void * client_data)
+{
+  auto * self = static_cast<LivoxLidarDevice *>(client_data);
+  if (self && data) {
+    self->on_imu_data(data);
+  }
+}
+
 void LivoxLidarDevice::InfoChangeCallback(
   uint32_t handle, const LivoxLidarInfo * info, void * client_data)
 {
@@ -143,6 +153,11 @@ void LivoxLidarDevice::on_info_change(
   SetLivoxLidarPclDataType(
     handle, kLivoxLidarCartesianCoordinateHighData, nullptr, nullptr);
   SetLivoxLidarWorkMode(handle, kLivoxLidarNormal, nullptr, nullptr);
+  if (imu_enabled_.load()) {
+    const livox_status st = EnableLivoxLidarImuData(handle, nullptr, nullptr);
+    std::cerr << "[LivoxLidarDevice] EnableLivoxLidarImuData status="
+              << static_cast<int>(st) << "\n";
+  }
   lidar_ready_.store(true);
   // Kick an immediate temperature query once the handle is known.
   last_temp_query_ns_.store(0);
@@ -400,11 +415,49 @@ void LivoxLidarDevice::on_point_cloud(LivoxLidarEthernetPacket * pkt)
         static_cast<float>(pts[i].reflectivity1), i);
     }
   } else {
-    // IMU or unknown — ignore.
+    // IMU is handled by ImuDataCallback. Unknown PCL types ignored.
     return;
   }
 
   ++pkt_count_;
+}
+
+void LivoxLidarDevice::on_imu_data(LivoxLidarEthernetPacket * pkt)
+{
+  if (!pkt || !imu_enabled_.load() || pkt->data_type != kLivoxLidarImuData) {
+    return;
+  }
+  if (pkt->dot_num == 0) {
+    return;
+  }
+  auto * samples = reinterpret_cast<LivoxLidarImuRawPoint *>(pkt->data);
+  const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::system_clock::now().time_since_epoch()).count();
+  // Livox IMU accel is in g; ROS sensor_msgs/Imu is m/s^2. Gyro is rad/s.
+  constexpr float kG = 9.80665f;
+  std::lock_guard<std::mutex> lock(imu_mu_);
+  for (uint32_t i = 0; i < pkt->dot_num; ++i) {
+    LidarImuSample s;
+    s.timestamp_ns = now_ns;
+    s.gx = samples[i].gyro_x;
+    s.gy = samples[i].gyro_y;
+    s.gz = samples[i].gyro_z;
+    s.ax = samples[i].acc_x * kG;
+    s.ay = samples[i].acc_y * kG;
+    s.az = samples[i].acc_z * kG;
+    imu_q_.push_back(s);
+  }
+  while (imu_q_.size() > 2000) {
+    imu_q_.pop_front();
+  }
+}
+
+void LivoxLidarDevice::drain_imu(std::vector<LidarImuSample> & out)
+{
+  out.clear();
+  std::lock_guard<std::mutex> lock(imu_mu_);
+  out.assign(imu_q_.begin(), imu_q_.end());
+  imu_q_.clear();
 }
 
 void LivoxLidarDevice::open(const LidarOpenConfig & config)
@@ -426,6 +479,11 @@ void LivoxLidarDevice::open(const LidarOpenConfig & config)
   }
   lidar_ready_.store(false);
   handle_.store(0);
+  imu_enabled_.store(cfg_.enable_imu);
+  {
+    std::lock_guard<std::mutex> lock(imu_mu_);
+    imu_q_.clear();
+  }
   core_temp_valid_.store(false);
   environment_temp_valid_.store(false);
   temp_query_inflight_.store(false);
@@ -444,7 +502,8 @@ void LivoxLidarDevice::open(const LidarOpenConfig & config)
   std::cerr << "[LivoxLidarDevice] SdkInit config=" << config_path_used_
             << " host=" << (host[0] ? host : "(default)")
             << " frame_time_ms=" << frame_time_ms_
-            << " temp_query_period_s=" << temp_query_period_s_ << "\n";
+            << " temp_query_period_s=" << temp_query_period_s_
+            << " imu=" << (cfg_.enable_imu ? "on" : "off") << "\n";
   // Must run before LivoxLidarSdkInit — InitLogger only reads this flag once.
   // Also silences an already-created logger if SDK was previously inited.
   DisableLivoxSdkConsoleLogger();
@@ -455,6 +514,9 @@ void LivoxLidarDevice::open(const LidarOpenConfig & config)
   }
   DisableLivoxSdkConsoleLogger();
   SetLivoxLidarPointCloudCallBack(PointCloudCallback, this);
+  if (cfg_.enable_imu) {
+    SetLivoxLidarImuDataCallback(ImuDataCallback, this);
+  }
   SetLivoxLidarInfoChangeCallback(InfoChangeCallback, this);
   // Periodic push (cmd 0x0102) carries core_temp — preferred over GetInternalInfo.
   SetLivoxLidarInfoCallback(InfoPushCallback, this);
@@ -516,6 +578,10 @@ void LivoxLidarDevice::stop()
   cv_.notify_all();
   lidar_ready_.store(false);
   handle_.store(0);
+  {
+    std::lock_guard<std::mutex> lock(imu_mu_);
+    imu_q_.clear();
+  }
   core_temp_valid_.store(false);
   environment_temp_valid_.store(false);
   temp_query_inflight_.store(false);

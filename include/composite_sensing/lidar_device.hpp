@@ -52,6 +52,16 @@ struct LidarOpenConfig
   int frame_time_ms{100};
   /// Livox: QueryLivoxLidarInternalInfo period (s). 0 disables.
   double temp_query_period_s{2.0};
+  /// Livox: EnableLivoxLidarImuData + IMU packet queue.
+  bool enable_imu{false};
+};
+
+/** One 6-DoF IMU sample. Accel is m/s^2, gyro rad/s, in the IMU frame. */
+struct LidarImuSample
+{
+  int64_t timestamp_ns{0};
+  float gx{0}, gy{0}, gz{0};
+  float ax{0}, ay{0}, az{0};
 };
 
 /** Optional vendor telemetry (temps, etc.). Invalid fields have *_valid=false. */
@@ -89,6 +99,9 @@ public:
   virtual void request_status_update() {}
 
   virtual LidarDeviceStatus get_status() const { return {}; }
+
+  /** Non-blocking drain of queued IMU samples (empty if unsupported / off). */
+  virtual void drain_imu(std::vector<LidarImuSample> & /*out*/) {}
 };
 
 }  // namespace composite_sensing

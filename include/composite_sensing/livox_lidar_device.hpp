@@ -4,6 +4,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -29,6 +30,7 @@ public:
 
   void open(const LidarOpenConfig & config) override;
   bool wait_cloud(LidarFrame & out, int timeout_ms) override;
+  void drain_imu(std::vector<LidarImuSample> & out) override;
   void stop() override;
   bool set_scanning(bool enable) override;
   void request_status_update() override;
@@ -44,6 +46,9 @@ private:
   static void PointCloudCallback(
     uint32_t handle, const uint8_t dev_type,
     LivoxLidarEthernetPacket * data, void * client_data);
+  static void ImuDataCallback(
+    uint32_t handle, const uint8_t dev_type,
+    LivoxLidarEthernetPacket * data, void * client_data);
   static void InfoChangeCallback(
     uint32_t handle, const LivoxLidarInfo * info, void * client_data);
   static void InfoPushCallback(
@@ -53,6 +58,7 @@ private:
     LivoxLidarDiagInternalInfoResponse * response, void * client_data);
 
   void on_point_cloud(LivoxLidarEthernetPacket * packet);
+  void on_imu_data(LivoxLidarEthernetPacket * packet);
   void on_info_change(uint32_t handle, const LivoxLidarInfo * info);
   void on_info_push(uint32_t handle, uint8_t dev_type, const char * info);
   void on_internal_info(
@@ -89,6 +95,10 @@ private:
   std::atomic<float> environment_temp_c_{0.f};
   std::atomic<int64_t> last_temp_query_ns_{0};
   std::atomic<bool> temp_query_inflight_{false};
+
+  std::mutex imu_mu_;
+  std::deque<LidarImuSample> imu_q_;
+  std::atomic<bool> imu_enabled_{false};
 };
 
 }  // namespace composite_sensing

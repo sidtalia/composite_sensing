@@ -28,7 +28,16 @@ Or after the package is built/installed:
 ros2 run composite_sensing install_deps.sh
 ```
 
-The script installs apt packages (`libembree-dev`, `libassimp-dev`, `libvulkan-dev`, `glslang-tools`, `libeigen3-dev`, …), checks RealSense + Unitree SDK + cuVSLAM paths, and exits non-zero if anything required is missing. Vulkan packages are optional at build time: without them `mesh_pf_node` still links Embree.
+The script installs apt packages (`libembree-dev`, `libassimp-dev`,
+`libvulkan-dev`, `glslang-tools`, `libeigen3-dev`, …), checks RealSense +
+Unitree SDK + cuVSLAM paths, and exits non-zero if anything required is
+missing. **`glslang-tools` is required** so CMake compiles the Vulkan
+`rayQuery` matcher; without `glslangValidator` on `PATH` at configure
+time, `mesh_pf_node` is Embree-only and `raycast_backend: auto` never
+tries the GPU. Run this script **before** the first `colcon build` of
+this package (see `hound_core/docs/context.md` §4b). If you already
+built Embree-only: install the packages, then
+`colcon build --packages-select composite_sensing --cmake-force-configure`.
 
 | Env | Effect |
 |-----|--------|
@@ -79,9 +88,13 @@ ros2 run composite_sensing lidar_mesh_composite_node --ros-args \
 
 `mesh_pf_node` (SSoT `mesh_pf:`) traces closest-hit rays against a triangle map.
 
+`map←odom` is latched on `/tf_static` (same pattern as ArUco) so RViz can
+look up `livox_frame→map` at the cloud stamp. A second static map←odom
+(bag ArUco) will fight it.
+
 | `raycast_backend` | Behavior |
 |---|---|
-| `auto` (default) | Vulkan `rayQuery` (Orin RT cores) if device creation succeeds, else Embree |
+| `auto` (default) | Vulkan `rayQuery` (Orin RT cores) if compiled in **and** device creation succeeds, else Embree |
 | `vulkan` | Vulkan only; node fails if RT is unavailable |
 | `embree` | CPU Embree packet intersect (`rtcIntersect4`) |
 
