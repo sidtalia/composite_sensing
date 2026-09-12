@@ -739,8 +739,15 @@ void VulkanMeshRaycaster::batchIntersect(const Ray * rays, Hit * hits, size_t n)
   const uint32_t count = static_cast<uint32_t>(n);
   vkCmdPushConstants(
     I.cmd, I.pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t), &count);
-  const uint32_t groups = (count + 63u) / 64u;
-  vkCmdDispatch(I.cmd, groups, 1, 1);
+  constexpr uint32_t kLocal = 64u;
+  constexpr uint32_t kMaxGroups = 65535u;
+  const uint32_t groups_1d = (count + kLocal - 1u) / kLocal;
+  const uint32_t gx = std::min(groups_1d, kMaxGroups);
+  const uint32_t gy = (groups_1d + gx - 1u) / gx;
+  if (gy > kMaxGroups) {
+    throw std::runtime_error("Vulkan RT: ray count exceeds dispatch limit");
+  }
+  vkCmdDispatch(I.cmd, gx, gy, 1);
 
   VkMemoryBarrier shader_to_host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
   shader_to_host.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;

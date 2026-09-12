@@ -11,6 +11,9 @@ namespace composite_sensing {
 struct PoseOptical {
   std::array<float, 3> translation{0.f, 0.f, 0.f};
   std::array<float, 4> rotation{0.f, 0.f, 0.f, 1.f};  // xyzw
+  /** Raw cuVSLAM 6×6, row-major [rx,ry,rz,x,y,z] in the optical frame. */
+  std::array<float, 36> covariance{};
+  bool has_covariance{false};
 };
 
 struct VslamConfig {

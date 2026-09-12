@@ -108,6 +108,12 @@ std::optional<PoseOptical> CuvslamBackend::track(const StereoFrame & stereo)
     pose.translation[0], pose.translation[1], pose.translation[2]};
   out.rotation = {
     pose.rotation[0], pose.rotation[1], pose.rotation[2], pose.rotation[3]};
+  // Slam::Track returns Pose only; keep VO covariance from world_from_rig.
+  const auto & cov = estimate.world_from_rig->covariance;
+  for (size_t i = 0; i < 36; ++i) {
+    out.covariance[i] = cov.data()[i];
+  }
+  out.has_covariance = true;
   return out;
 }
 

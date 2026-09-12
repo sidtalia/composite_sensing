@@ -13,11 +13,10 @@ namespace composite_sensing
 {
 
 /**
- * RMCL-style particle filter against a triangle mesh.
- * Raycast backend is Vulkan RT when available, else Embree.
- * Motion model: constant twist estimated by differentiating the filter mean
- * (starts at 0). No external odom — safe to fuse pose into an EKF that already
- * consumes VSLAM/wheels.
+ * Mesh particle filter against a triangle mesh (Vulkan RT / Embree).
+ * Particles are SE(3): translation + full quaternion.
+ * Motion: odom delta when tracking and OdomDelta is valid, otherwise
+ * constant-twist from the filter mean (global, or tracking with odom off).
  */
 class ConstantTwistMeshPfBackend : public MeshLocalizerBackend
 {
@@ -27,10 +26,19 @@ public:
 
   void configure(const MeshLocalizerConfig & config) override;
   void global_init() override;
-  std::optional<PoseMap> localize(const LidarFrame & cloud) override;
+  void seed_from_pose(
+    const std::array<double, 3> & translation,
+    const std::array<double, 4> & rotation_xyzw,
+    double trans_std_m,
+    double rot_std_rad) override;
+  void reset() override;
+  std::optional<PoseMap> localize(
+    const LidarFrame & cloud, const OdomDelta & odom) override;
 
   const std::string & raycast_backend_used() const { return raycast_backend_used_; }
   size_t triangle_count() const { return map_ ? map_->triangle_count() : 0; }
+  size_t particle_count() const { return particles_.size(); }
+  bool tracking() const { return tracking_; }
 
   /** Last localize() wall times (ms). Raycast is the mesh matcher. */
   struct Timing
@@ -47,20 +55,25 @@ private:
   struct Particle
   {
     double x{0}, y{0}, z{0};
-    double yaw{0};
+    double qx{0}, qy{0}, qz{0}, qw{1};
     double weight{1.0};
   };
 
-  void motion_update(double dt);
+  /** Lidar sample in base_link: unit direction from lidar origin + range. */
+  struct BaseSample
+  {
+    float dx{0}, dy{0}, dz{1};
+    float range{0};
+  };
+
+  void scatter_particles();
+  void resize_ensemble(int n);
+  int tracking_particle_count() const;
+  void reset_motion_state();
+  void motion_update(double dt, const OdomDelta & odom);
   void sensor_update(const LidarFrame & cloud);
   void resample();
   PoseMap mean_pose() const;
-
-  /** Fill ray + measured range for one particle / lidar sample. */
-  void fill_ray(
-    double bx, double by, double bz, double byaw,
-    float px, float py, float pz,
-    Ray & ray, float & meas) const;
 
   MeshLocalizerConfig cfg_{};
   std::unique_ptr<MeshRaycaster> map_;
@@ -69,12 +82,16 @@ private:
   std::vector<Ray> rays_;
   std::vector<Hit> hits_;
   std::vector<float> meas_;
+  std::vector<BaseSample> samples_base_;
   mutable std::mutex mu_;
 
+  bool initialized_{false};
+  bool tracking_{false};
   bool have_mean_{false};
   PoseMap last_mean_{};
   int64_t last_stamp_ns_{0};
-  double vx_{0}, vy_{0}, vz_{0}, wyaw_{0};
+  double vx_{0}, vy_{0}, vz_{0};
+  double wx_{0}, wy_{0}, wz_{0};
 
   std::mt19937 rng_{std::random_device{}()};
   Timing last_timing_{};

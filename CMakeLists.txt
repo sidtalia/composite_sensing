@@ -217,6 +217,7 @@ if(EMBREE_LIB AND EMBREE_INCLUDE_DIR)
     src/mesh_pf_main.cpp
     src/mesh_pf_node.cpp
     src/constant_twist_mesh_pf_backend.cpp
+    src/micp_l_backend.cpp
     src/assimp_mesh_load.cpp
     src/embree_mesh_map.cpp
     src/mesh_raycaster.cpp
@@ -234,12 +235,14 @@ if(EMBREE_LIB AND EMBREE_INCLUDE_DIR)
     sensor_msgs
     geometry_msgs
     std_srvs
+    std_msgs
     tf2
     tf2_ros
   )
   target_link_libraries(mesh_pf_node
     ${EMBREE_LIB}
     assimp::assimp
+    Eigen3::Eigen
   )
   if(HAVE_VULKAN_RT)
     target_compile_definitions(mesh_pf_node PRIVATE HOUND_HAVE_VULKAN_RT=1)

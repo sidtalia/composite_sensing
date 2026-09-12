@@ -851,6 +851,15 @@ void StereoCompositeModularNode::publish_odom_tf(
   odom.pose.pose.orientation.z = q[2];
   odom.pose.pose.orientation.w = q[3];
 
+  if (odom_source_ != "gt" && pose_opt.has_covariance) {
+    fill_odom_pose_covariance(
+      pose_opt.covariance.data(), apply_body_mount_,
+      R_body_sensor_, t_body_sensor_, odom.pose.covariance);
+  } else {
+    odom.pose.covariance[0] = -1.0;
+  }
+  odom.twist.covariance[0] = -1.0;
+
   if (prev_stamp_.nanoseconds() > 0) {
     const double dt = (stamp - prev_stamp_).seconds();
     if (dt > 1e-6) {
@@ -898,6 +907,8 @@ void StereoCompositeModularNode::publish_gt_odom(
   odom.pose.pose.orientation.y = pose_opt.rotation[1];
   odom.pose.pose.orientation.z = pose_opt.rotation[2];
   odom.pose.pose.orientation.w = pose_opt.rotation[3];
+  odom.pose.covariance[0] = -1.0;
+  odom.twist.covariance[0] = -1.0;
   gt_odom_pub_->publish(odom);
 }
 

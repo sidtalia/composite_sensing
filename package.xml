@@ -22,6 +22,7 @@
   <depend>tf2_eigen</depend>
   <depend>eigen</depend>
   <depend>std_srvs</depend>
+  <depend>std_msgs</depend>
   <depend>librealsense2</depend>
   <depend>libopencv-dev</depend>
   <build_depend>assimp</build_depend>

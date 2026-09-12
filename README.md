@@ -5,7 +5,7 @@ Stereo + lidar composite sensing for HOUND.
 - **`CameraDevice` / `RealsenseCameraDevice` / `DatasetCameraDevice`** — transport-agnostic stereo/color/depth (RealSense or rail-sim PNG dataset)
 - **`VslamBackend` / `CuvslamBackend`** — VO/SLAM from stereo frames (Isaac `libcuvslam`)
 - **`LidarDevice` / `UnilidarLidarDevice` / `LivoxLidarDevice`** — Unitree + Livox Mid-360(S) (SDK2); Ouster TBD
-- **`MeshLocalizerBackend` / `ConstantTwistMeshPfBackend`** — mesh PF with Vulkan `rayQuery` (Orin RT cores) or Embree CPU fallback; internal constant-twist motion (no EKF odom)
+- **`MeshLocalizerBackend` / `MicpLBackend` / `ConstantTwistMeshPfBackend`** — mesh localization. After a pose seed, default tracking is MICP-L (Embree raycast correspondences + point-to-plane). PF (`tracking_backend: pf`) for bbox / kidnap. Vulkan `rayQuery` for the PF; MICP-L uses Embree Ng.
 - **Nodes:** `stereo_composite_modular_node`, `lidar_mesh_composite_node`, `multicam_rail_replay`
 
 ## Known limitation: cuVSLAM

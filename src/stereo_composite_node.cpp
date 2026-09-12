@@ -463,6 +463,15 @@ void StereoCompositeNode::capture_loop()
     }
 
     cuvslam::Pose pose = estimate.world_from_rig->pose;
+    std::array<float, 36> pose_cov{};
+    bool has_pose_cov = false;
+    {
+      const auto & cov = estimate.world_from_rig->covariance;
+      for (size_t i = 0; i < 36; ++i) {
+        pose_cov[i] = cov.data()[i];
+      }
+      has_pose_cov = true;
+    }
     double slam_ms = 0.0;
     try {
       cuvslam::Odometry::State state;
@@ -546,6 +555,8 @@ void StereoCompositeNode::capture_loop()
     {
       std::lock_guard<std::mutex> lock(slot_.mu);
       slot_.pose = pose;
+      slot_.pose_covariance = pose_cov;
+      slot_.has_pose_covariance = has_pose_cov;
       slot_.ros_stamp = this->get_clock()->now();
       slot_.has_pose = true;
       ++slot_.pose_seq;
@@ -563,7 +574,8 @@ void StereoCompositeNode::capture_loop()
 }
 
 void StereoCompositeNode::publish_odom_tf(
-  const rclcpp::Time & stamp, const cuvslam::Pose & pose)
+  const rclcpp::Time & stamp, const cuvslam::Pose & pose,
+  const float * cov_cuv, bool has_cov)
 {
   std::array<double, 3> t{};
   std::array<double, 4> q{};
@@ -588,6 +600,15 @@ void StereoCompositeNode::publish_odom_tf(
   odom.pose.pose.orientation.y = q[1];
   odom.pose.pose.orientation.z = q[2];
   odom.pose.pose.orientation.w = q[3];
+
+  if (has_cov && cov_cuv != nullptr) {
+    fill_odom_pose_covariance(
+      cov_cuv, apply_body_mount_,
+      R_body_sensor_, t_body_sensor_, odom.pose.covariance);
+  } else {
+    odom.pose.covariance[0] = -1.0;
+  }
+  odom.twist.covariance[0] = -1.0;
 
   if (prev_stamp_.nanoseconds() > 0) {
     const double dt = (stamp - prev_stamp_).seconds();
@@ -623,6 +644,8 @@ void StereoCompositeNode::odom_worker()
   uint64_t last_seq = 0;
   while (running_ && rclcpp::ok()) {
     cuvslam::Pose pose;
+    std::array<float, 36> pose_cov{};
+    bool has_pose_cov = false;
     rclcpp::Time stamp{0, 0, RCL_ROS_TIME};
     {
       std::unique_lock<std::mutex> lock(slot_.mu);
@@ -637,9 +660,11 @@ void StereoCompositeNode::odom_worker()
       }
       last_seq = slot_.pose_seq;
       pose = slot_.pose;
+      pose_cov = slot_.pose_covariance;
+      has_pose_cov = slot_.has_pose_covariance;
       stamp = slot_.ros_stamp;
     }
-    publish_odom_tf(stamp, pose);
+    publish_odom_tf(stamp, pose, has_pose_cov ? pose_cov.data() : nullptr, has_pose_cov);
   }
 }
 

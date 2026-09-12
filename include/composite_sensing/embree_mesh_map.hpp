@@ -12,6 +12,16 @@
 namespace composite_sensing
 {
 
+/** Closest-hit plus Embree Ng (unit, facing the incoming ray). */
+struct HitPlane
+{
+  float t{-1.f};
+  uint32_t hit{0};
+  float nx{0.f};
+  float ny{0.f};
+  float nz{1.f};
+};
+
 /** Triangle mesh accelerated with Embree 4 (CPU packet raycast). */
 class EmbreeMeshMap : public MeshRaycaster
 {
@@ -28,6 +38,7 @@ public:
   const char * backend_name() const override { return "embree"; }
   size_t triangle_count() const override { return indices_.size() / 3; }
   void batchIntersect(const Ray * rays, Hit * hits, size_t n) override;
+  void batchIntersectPlane(const Ray * rays, HitPlane * hits, size_t n);
 
 private:
   RTCDevice device_{nullptr};

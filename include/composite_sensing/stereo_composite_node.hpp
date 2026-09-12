@@ -50,6 +50,8 @@ private:
     // ROS-time stamp for odom/TF (nvblox TF lookups + delay stats).
     rclcpp::Time ros_stamp{0, 0, RCL_ROS_TIME};
     cuvslam::Pose pose{};
+    std::array<float, 36> pose_covariance{};
+    bool has_pose_covariance{false};
 
     // Latest stereo frameset (IR ± depth) for depth worker.
     bool has_stereo{false};
@@ -70,7 +72,9 @@ private:
   void odom_worker();
   void color_worker();
   void depth_worker();
-  void publish_odom_tf(const rclcpp::Time & stamp, const cuvslam::Pose & pose);
+  void publish_odom_tf(
+    const rclcpp::Time & stamp, const cuvslam::Pose & pose,
+    const float * cov_cuv, bool has_cov);
 
   // Params (startup-only)
   std::string serial_number_;
