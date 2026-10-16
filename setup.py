@@ -11,10 +11,15 @@ setup(
             ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
     ],
-    install_requires=["setuptools"],
+    install_requires=["setuptools", "numpy", "pyyaml"],
     zip_safe=True,
     maintainer="hound",
     maintainer_email="hound@todo.todo",
     description="Stereo camera + derived VSLAM (composite sensing).",
     license="Apache-2.0",
+    entry_points={
+        "console_scripts": [
+            "multicam_rail_replay = composite_sensing.multicam_rail_replay:main",
+        ],
+    },
 )

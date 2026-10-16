@@ -97,6 +97,20 @@ struct CameraOpenConfig {
   int visual_preset{3};
   int emitter_enabled{0};
   float clip_distance_m{0.f};
+  /** Optional USB hardware reset before opening streams (ROS default: false). */
+  bool initial_reset{false};
+
+  /**
+   * DatasetCameraDevice only (ignored by RealSense).
+   * Rail layout: ``{dataset_path}/camera.txt`` + ``frames/NNNNNN[_view]_*``.
+   * Empty ``dataset_view`` → legacy single-view stems (no view infix).
+   */
+  std::string dataset_path;
+  std::string dataset_view{"front"};
+  bool dataset_loop{true};
+  double dataset_rate_hz{30.0};
+  /** Stereo baseline (m) when IR exists or for synthetic right IR. */
+  float dataset_baseline_m{0.05f};
 };
 
 /**

@@ -50,6 +50,8 @@ private:
     // ROS-time stamp for odom/TF (nvblox TF lookups + delay stats).
     rclcpp::Time ros_stamp{0, 0, RCL_ROS_TIME};
     cuvslam::Pose pose{};
+    std::array<float, 36> pose_covariance{};
+    bool has_pose_covariance{false};
 
     // Latest stereo frameset (IR ± depth) for depth worker.
     bool has_stereo{false};
@@ -70,7 +72,9 @@ private:
   void odom_worker();
   void color_worker();
   void depth_worker();
-  void publish_odom_tf(const rclcpp::Time & stamp, const cuvslam::Pose & pose);
+  void publish_odom_tf(
+    const rclcpp::Time & stamp, const cuvslam::Pose & pose,
+    const float * cov_cuv, bool has_cov);
 
   // Params (startup-only)
   std::string serial_number_;
@@ -92,9 +96,14 @@ private:
   int emitter_enabled_{0};
   int visual_preset_{3};  // rs400: 3 = high_accuracy
   double clip_distance_{0.0};
+  bool initial_reset_{false};
   std::string odom_topic_;
   std::string odom_frame_;
   std::string base_frame_;
+  bool publish_odom_tf_{false};
+  bool apply_body_mount_{false};
+  std::array<double, 3> t_body_sensor_{{0, 0, 0}};
+  std::array<double, 9> R_body_sensor_{{1, 0, 0, 0, 1, 0, 0, 0, 1}};
   bool async_sba_{true};
   bool slam_sync_mode_{false};
   int warmup_frames_{60};

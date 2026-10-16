@@ -2,11 +2,15 @@
 
 Stereo + lidar composite sensing for HOUND.
 
-- **`CameraDevice` / `RealsenseCameraDevice`** — transport-agnostic stereo/color/depth
+- **`CameraDevice` / `RealsenseCameraDevice` / `DatasetCameraDevice`** — transport-agnostic stereo/color/depth (RealSense or rail-sim PNG dataset)
 - **`VslamBackend` / `CuvslamBackend`** — VO/SLAM from stereo frames (Isaac `libcuvslam`)
-- **`LidarDevice` / `UnilidarLidarDevice`** — Unitree SDK hot path (Ouster/Livox adapters TBD)
-- **`MeshLocalizerBackend` / `ConstantTwistMeshPfBackend`** — Embree mesh PF, internal constant-twist motion (no EKF odom)
-- **Nodes:** `stereo_composite_modular_node`, `lidar_mesh_composite_node`
+- **`LidarDevice` / `UnilidarLidarDevice` / `LivoxLidarDevice`** — Unitree + Livox Mid-360(S) (SDK2); Ouster TBD
+- **`MeshLocalizerBackend` / `MicpLBackend` / `ConstantTwistMeshPfBackend`** — mesh localization. After a pose seed, default tracking is MICP-L (Embree raycast correspondences + point-to-plane). PF (`tracking_backend: pf`) for bbox / kidnap. Vulkan `rayQuery` for the PF; MICP-L uses Embree Ng.
+- **Nodes:** `stereo_composite_modular_node`, `lidar_mesh_composite_node`, `multicam_rail_replay`
+
+## Known limitation: cuVSLAM
+
+cuVSLAM can be **overconfident** after large motions: tracking continues in a new attitude reference while reported confidence stays high. With a single VSLAM source into the EKF, glitches are hard to detect (tilt re-align is a partial mitigation). Prefer multi-cam VSLAM or an independent absolute pose (GPS / mesh ICP / mocap). GPS should make disagreement easier to spot; mocap validation is planned. See `hound_core/config/SSoT.yaml` (`stereo_composite` header) and `hound_core/docs/context.md`.
 
 `lidar_mesh_composite_node` publishes `/localization/mesh_pose` (`PoseWithCovarianceStamped`) as a map-absolute aid for the EKF, plus optional `/unilidar/cloud` and static `parent→lidar` TF. Relocalize: `ros2 service call /lidar_mesh_composite/global_localization std_srvs/srv/Empty {}`.
 
@@ -24,7 +28,16 @@ Or after the package is built/installed:
 ros2 run composite_sensing install_deps.sh
 ```
 
-The script installs apt packages (`libembree-dev`, `libassimp-dev`, `libeigen3-dev`, …), checks RealSense + Unitree SDK + cuVSLAM paths, and exits non-zero if anything required is missing.
+The script installs apt packages (`libembree-dev`, `libassimp-dev`,
+`libvulkan-dev`, `glslang-tools`, `libeigen3-dev`, …), checks RealSense +
+Unitree SDK + cuVSLAM paths, and exits non-zero if anything required is
+missing. **`glslang-tools` is required** so CMake compiles the Vulkan
+`rayQuery` matcher; without `glslangValidator` on `PATH` at configure
+time, `mesh_pf_node` is Embree-only and `raycast_backend: auto` never
+tries the GPU. Run this script **before** the first `colcon build` of
+this package (see `hound_core/docs/context.md` §4b). If you already
+built Embree-only: install the packages, then
+`colcon build --packages-select composite_sensing --cmake-force-configure`.
 
 | Env | Effect |
 |-----|--------|
@@ -54,8 +67,40 @@ Prefer launching via `hound_core` SSoT (`stereo_composite:` / `lidar.composite:`
 ros2 run composite_sensing stereo_composite_modular_node --ros-args \
   -p serial_number:=030422250301 -p enable_color:=true
 
+# DatasetCameraDevice (rail sim) via the same modular node:
+ros2 run composite_sensing stereo_composite_modular_node --ros-args \
+  -p camera_backend:=dataset \
+  -p dataset_path:=/path/to/rail_sim/race-2_multicam \
+  -p dataset_view:=front \
+  -p dataset_rate_hz:=10.0 \
+  -p enable_vslam:=false \
+  -p warmup_frames:=0 \
+  -p enable_color:=true -p enable_depth:=true \
+  -p camera_name:=front -p base_frame:=front_link
+
 ros2 run composite_sensing lidar_mesh_composite_node --ros-args \
   -p port:=/dev/ttyUSB0 \
   -p map_file:=/path/to/map.dae \
   -p localize_hz:=10.0
+```
+
+## mesh_pf raycast backend
+
+`mesh_pf_node` (SSoT `mesh_pf:`) traces closest-hit rays against a triangle map.
+
+`map←odom` is latched on `/tf_static` (same pattern as ArUco) so RViz can
+look up `livox_frame→map` at the cloud stamp. A second static map←odom
+(bag ArUco) will fight it.
+
+| `raycast_backend` | Behavior |
+|---|---|
+| `auto` (default) | Vulkan `rayQuery` (Orin RT cores) if compiled in **and** device creation succeeds, else Embree |
+| `vulkan` | Vulkan only; node fails if RT is unavailable |
+| `embree` | CPU Embree packet intersect (`rtcIntersect4`) |
+
+```bash
+ros2 run composite_sensing mesh_pf_node --ros-args \
+  -p map_file:=/path/to/map.dae \
+  -p cloud_topic:=/livox/cloud \
+  -p raycast_backend:=auto
 ```
