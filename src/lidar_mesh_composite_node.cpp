@@ -146,6 +146,11 @@ void LidarMeshCompositeNode::declare_params()
     deskew_wire_latency_ns_ =
       static_cast<int64_t>(std::llround(wire_ms * 1e6));
   }
+  deskew_backend_ = declare_parameter<std::string>("deskew.backend", "odom");
+  fast_lio_odom_topic_ = declare_parameter<std::string>(
+    "fast_lio.odom_topic", "/lidar_inertial/odom");
+  fast_lio_odom_frame_ = declare_parameter<std::string>(
+    "fast_lio.odom_frame", "lidar_inertial");
 
   // Assume base_link → lidar is fixed (rigid mount). T_base_lidar comes from
   // SSoT lidar xyz/rpy, not from TF. Do not look this up per scan.
@@ -198,10 +203,29 @@ void LidarMeshCompositeNode::start_pipeline()
   static_tf_ = std::make_unique<tf2_ros::StaticTransformBroadcaster>(this);
   publish_static_lidar_tf();
 
-  if (deskew_enable_) {
+  if (deskew_enable_ && deskew_backend_ != "fast_lio") {
     odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
       deskew_odom_topic_, rclcpp::SensorDataQoS(),
       std::bind(&LidarMeshCompositeNode::on_odom, this, std::placeholders::_1));
+  }
+  if (deskew_backend_ == "fast_lio") {
+    if (!enable_imu_) {
+      throw std::runtime_error(
+        "deskew.backend=fast_lio requires enable_imu (Livox IMU)");
+    }
+    FastLioConfig lio_cfg;
+    Eigen::Isometry3d T_lidar_imu = Eigen::Isometry3d::Identity();
+    T_lidar_imu.translation() = Eigen::Vector3d(imu_x_, imu_y_, imu_z_);
+    T_lidar_imu.linear() =
+      Eigen::Quaterniond(imu_qw_, imu_qx_, imu_qy_, imu_qz_)
+      .normalized()
+      .toRotationMatrix();
+    const Eigen::Isometry3d T_imu_lidar = T_lidar_imu.inverse();
+    lio_cfg.lidar_T_wrt_imu = T_imu_lidar.translation();
+    lio_cfg.lidar_R_wrt_imu = T_imu_lidar.linear();
+    fast_lio_ = std::make_unique<FastLioOdometry>(lio_cfg);
+    lio_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(
+      fast_lio_odom_topic_, 10);
   }
 
   if (publish_cloud_) {
@@ -235,9 +259,9 @@ void LidarMeshCompositeNode::start_pipeline()
     lidar_ip_.empty() ? "(n/a)" : lidar_ip_.c_str(),
     cloud_topic_.c_str(),
     enable_imu_ ? imu_topic_.c_str() : "off",
-    deskew_enable_ ? "on" : "off",
-    deskew_odom_topic_.c_str(),
-    deskew_motion_frame_.c_str(),
+    fast_lio_ ? "fast_lio" : (deskew_enable_ ? "odom" : "off"),
+    fast_lio_ ? fast_lio_odom_topic_.c_str() : deskew_odom_topic_.c_str(),
+    fast_lio_ ? fast_lio_odom_frame_.c_str() : deskew_motion_frame_.c_str(),
     static_cast<double>(deskew_wire_latency_ns_) * 1e-6,
     lidar_frame_.c_str());
 }
@@ -295,6 +319,9 @@ void LidarMeshCompositeNode::publish_imu()
     msg.linear_acceleration.y = s.ay;
     msg.linear_acceleration.z = s.az;
     imu_pub_->publish(msg);
+  }
+  if (fast_lio_) {
+    emit_lio(fast_lio_->push_imu(samples));
   }
 }
 
@@ -430,57 +457,71 @@ void LidarMeshCompositeNode::capture_loop()
       last_cloud_steady_ = now_tp;
       last_cloud_points_ = cloud.points.size();
       publish_imu();
-      // Header is host receive (flush ≈ scan end, minus intra-scan span).
-      // Subtract wire/SDK latency so stamp is photon time; deskew window
-      // then sits in the past of EKF odom instead of at host now.
-      if (deskew_wire_latency_ns_ > 0 &&
-        cloud.timestamp_ns > deskew_wire_latency_ns_)
-      {
-        cloud.timestamp_ns -= deskew_wire_latency_ns_;
-      }
       publish_temperatures();
 
-      if (publish_raw_cloud_ && raw_cloud_pub_) {
-        publish_cloud(cloud, raw_cloud_pub_);
-      }
-
-      LidarFrame out = cloud;
-      if (deskew_enable_) {
-        double max_off = 0.0;
-        for (const auto & p : cloud.points) {
-          if (std::isfinite(p.time_offset_s)) {
-            max_off = std::max(max_off, static_cast<double>(p.time_offset_s));
-          }
+      if (fast_lio_) {
+        if (publish_raw_cloud_ && raw_cloud_pub_) {
+          publish_cloud(cloud, raw_cloud_pub_);
         }
-        const int64_t end_ns =
-          cloud.timestamp_ns +
-          static_cast<int64_t>(std::llround(max_off * 1e9));
-        const auto poses = snapshot_odom_poses(cloud.timestamp_ns, end_ns);
-        const DeskewResult dr = deskew_lidar_frame(
-          out, T_base_lidar_, poses, deskew_reference_);
-        if (dr.ok) {
-          if (dr.elapsed_ms >= deskew_warn_ms_) {
-            RCLCPP_WARN(
-              get_logger(), "deskew took %.2f ms (warn threshold %.1f)",
-              dr.elapsed_ms, deskew_warn_ms_);
-          }
+        const auto scans = fast_lio_->push_cloud(cloud);
+        if (scans.empty() && !fast_lio_->initialized()) {
           RCLCPP_INFO_THROTTLE(
-            get_logger(), *get_clock(), 5000,
-            "deskew wall time: %.2f ms poses=%zu",
-            dr.elapsed_ms, poses.size());
-        } else {
+            get_logger(), *get_clock(), 2000, "fast-lio initializing");
+        } else if (scans.empty() && fast_lio_->pending_scans() > 0) {
           RCLCPP_WARN_THROTTLE(
             get_logger(), *get_clock(), 2000,
-            "deskew skipped (%.2f ms): %s — publishing raw",
-            dr.elapsed_ms, dr.error.c_str());
-          out = cloud;
+            "fast-lio waiting on imu (%zu scans)", fast_lio_->pending_scans());
         }
-      }
-
-      if (publish_cloud_) {
-        publish_cloud(out, cloud_pub_);
-        ++clouds_published_;
-        points_published_ += out.points.size();
+        emit_lio(scans);
+      } else {
+        // Header is host receive (flush ≈ scan end, minus intra-scan span).
+        // Subtract wire/SDK latency so stamp is photon time; deskew window
+        // then sits in the past of EKF odom instead of at host now.
+        if (deskew_wire_latency_ns_ > 0 &&
+          cloud.timestamp_ns > deskew_wire_latency_ns_)
+        {
+          cloud.timestamp_ns -= deskew_wire_latency_ns_;
+        }
+        if (publish_raw_cloud_ && raw_cloud_pub_) {
+          publish_cloud(cloud, raw_cloud_pub_);
+        }
+        LidarFrame out = cloud;
+        if (deskew_enable_) {
+          double max_off = 0.0;
+          for (const auto & p : cloud.points) {
+            if (std::isfinite(p.time_offset_s)) {
+              max_off = std::max(max_off, static_cast<double>(p.time_offset_s));
+            }
+          }
+          const int64_t end_ns =
+            cloud.timestamp_ns +
+            static_cast<int64_t>(std::llround(max_off * 1e9));
+          const auto poses = snapshot_odom_poses(cloud.timestamp_ns, end_ns);
+          const DeskewResult dr = deskew_lidar_frame(
+            out, T_base_lidar_, poses, deskew_reference_);
+          if (dr.ok) {
+            if (dr.elapsed_ms >= deskew_warn_ms_) {
+              RCLCPP_WARN(
+                get_logger(), "deskew took %.2f ms (warn threshold %.1f)",
+                dr.elapsed_ms, deskew_warn_ms_);
+            }
+            RCLCPP_INFO_THROTTLE(
+              get_logger(), *get_clock(), 5000,
+              "deskew wall time: %.2f ms poses=%zu",
+              dr.elapsed_ms, poses.size());
+          } else {
+            RCLCPP_WARN_THROTTLE(
+              get_logger(), *get_clock(), 2000,
+              "deskew skipped (%.2f ms): %s — publishing raw",
+              dr.elapsed_ms, dr.error.c_str());
+            out = cloud;
+          }
+        }
+        if (publish_cloud_) {
+          publish_cloud(out, cloud_pub_);
+          ++clouds_published_;
+          points_published_ += out.points.size();
+        }
       }
     }
 
@@ -507,6 +548,43 @@ void LidarMeshCompositeNode::capture_loop()
       clouds_published_ = 0;
       points_published_ = 0;
       last_status_log_ = now_tp;
+    }
+  }
+}
+
+void LidarMeshCompositeNode::emit_lio(const std::vector<FastLioScan> & scans)
+{
+  for (const auto & scan : scans) {
+    if (publish_cloud_) {
+      publish_cloud(scan.cloud, cloud_pub_);
+      ++clouds_published_;
+      points_published_ += scan.cloud.points.size();
+      last_cloud_points_ = scan.cloud.points.size();
+    }
+    if (!scan.odom.valid || !lio_odom_pub_) {
+      continue;
+    }
+    nav_msgs::msg::Odometry msg;
+    msg.header.stamp = rclcpp::Time(scan.odom.stamp_ns);
+    msg.header.frame_id = fast_lio_odom_frame_;
+    msg.child_frame_id = imu_frame_;
+    msg.pose.pose.position.x = scan.odom.position.x();
+    msg.pose.pose.position.y = scan.odom.position.y();
+    msg.pose.pose.position.z = scan.odom.position.z();
+    msg.pose.pose.orientation.x = scan.odom.orientation.x();
+    msg.pose.pose.orientation.y = scan.odom.orientation.y();
+    msg.pose.pose.orientation.z = scan.odom.orientation.z();
+    msg.pose.pose.orientation.w = scan.odom.orientation.w();
+    msg.twist.twist.linear.x = scan.odom.vel_body.x();
+    msg.twist.twist.linear.y = scan.odom.vel_body.y();
+    msg.twist.twist.linear.z = scan.odom.vel_body.z();
+    lio_odom_pub_->publish(msg);
+    if (!lio_announced_) {
+      RCLCPP_INFO(
+        get_logger(), "fast-lio odom on %s (%s → %s)",
+        fast_lio_odom_topic_.c_str(), fast_lio_odom_frame_.c_str(),
+        imu_frame_.c_str());
+      lio_announced_ = true;
     }
   }
 }

@@ -20,7 +20,7 @@
   <depend>tf2</depend>
   <depend>tf2_ros</depend>
   <depend>tf2_eigen</depend>
-  <depend>eigen</depend>
+  <depend>libpcl-dev</depend>
   <depend>std_srvs</depend>
   <depend>std_msgs</depend>
   <depend>librealsense2</depend>
