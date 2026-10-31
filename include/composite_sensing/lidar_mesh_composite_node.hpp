@@ -19,6 +19,7 @@
 #include <tf2_ros/static_transform_broadcaster.h>
 
 #include "composite_sensing/cloud_deskew.hpp"
+#include "composite_sensing/fast_lio_odometry.hpp"
 #include "composite_sensing/lidar_device.hpp"
 
 namespace composite_sensing
@@ -46,6 +47,7 @@ private:
     const LidarFrame & cloud,
     const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr & pub);
   void publish_temperatures();
+  void emit_lio(const std::vector<FastLioScan> & scans);
   void on_odom(const nav_msgs::msg::Odometry::SharedPtr msg);
   std::vector<StampedOdomPose> snapshot_odom_poses(
     int64_t start_ns, int64_t end_ns);
@@ -89,6 +91,9 @@ private:
   double deskew_warn_ms_{40.0};
   double deskew_pose_buffer_s_{1.0};
   int64_t deskew_wire_latency_ns_{0};
+  std::string deskew_backend_{"odom"};
+  std::string fast_lio_odom_topic_{"/lidar_inertial/odom"};
+  std::string fast_lio_odom_frame_{"lidar_inertial"};
 
   // Assume base_link → lidar is fixed (rigid mount). From SSoT xyz/rpy, not TF.
   Eigen::Isometry3d T_base_lidar_{Eigen::Isometry3d::Identity()};
@@ -101,7 +106,9 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Temperature>::SharedPtr core_temp_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Temperature>::SharedPtr environment_temp_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr lio_odom_pub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  std::unique_ptr<FastLioOdometry> fast_lio_;
 
   std::mutex odom_mu_;
   std::deque<StampedOdomPose> odom_poses_;
@@ -116,6 +123,7 @@ private:
   std::chrono::steady_clock::time_point last_status_log_{};
   bool cloud_stale_warned_{false};
   bool core_temp_high_warned_{false};
+  bool lio_announced_{false};
 };
 
 }  // namespace composite_sensing

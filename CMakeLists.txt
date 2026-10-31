@@ -136,10 +136,25 @@ if(EXISTS "${UNITREE_SDK_LIB}")
   if(HAVE_LIVOX_SDK)
     list(APPEND LIDAR_MESH_SRCS src/livox_lidar_device.cpp)
   endif()
+  find_package(PCL REQUIRED COMPONENTS common filters)
+  find_package(OpenMP)
+  set(FAST_LIO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../FAST_LIO")
+  if(NOT EXISTS "${FAST_LIO_ROOT}/include/ikd-Tree/ikd_Tree.cpp")
+    message(FATAL_ERROR
+      "FAST-LIO ikd-Tree missing at ${FAST_LIO_ROOT}/include/ikd-Tree. "
+      "Clone https://github.com/hku-mars/ikd-Tree branch fast_lio there.")
+  endif()
+  list(APPEND LIDAR_MESH_SRCS
+    src/fast_lio_odometry.cpp
+    ${FAST_LIO_ROOT}/include/ikd-Tree/ikd_Tree.cpp
+  )
   add_executable(lidar_mesh_composite_node ${LIDAR_MESH_SRCS})
   target_include_directories(lidar_mesh_composite_node PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     ${UNITREE_SDK_ROOT}/include
+    ${PCL_INCLUDE_DIRS}
+    ${FAST_LIO_ROOT}/include
+    ${FAST_LIO_ROOT}/include/ikd-Tree
   )
   if(HAVE_LIVOX_SDK)
     target_include_directories(lidar_mesh_composite_node PUBLIC ${LIVOX_SDK_INCLUDE})
@@ -155,8 +170,37 @@ if(EXISTS "${UNITREE_SDK_LIB}")
   )
   target_link_libraries(lidar_mesh_composite_node
     ${UNITREE_SDK_LIB}
+    ${PCL_LIBRARIES}
     Eigen3::Eigen
+    pthread
   )
+  if(OpenMP_CXX_FOUND)
+    target_link_libraries(lidar_mesh_composite_node OpenMP::OpenMP_CXX)
+  endif()
+  set_source_files_properties(
+    ${FAST_LIO_ROOT}/include/ikd-Tree/ikd_Tree.cpp
+    PROPERTIES COMPILE_OPTIONS "-w"
+  )
+  add_executable(fast_lio_self_check
+    src/fast_lio_self_check.cpp
+    src/fast_lio_odometry.cpp
+    ${FAST_LIO_ROOT}/include/ikd-Tree/ikd_Tree.cpp
+  )
+  target_include_directories(fast_lio_self_check PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${PCL_INCLUDE_DIRS}
+    ${FAST_LIO_ROOT}/include
+    ${FAST_LIO_ROOT}/include/ikd-Tree
+  )
+  target_link_libraries(fast_lio_self_check
+    ${PCL_LIBRARIES}
+    Eigen3::Eigen
+    pthread
+  )
+  if(OpenMP_CXX_FOUND)
+    target_link_libraries(fast_lio_self_check OpenMP::OpenMP_CXX)
+  endif()
+  target_compile_features(fast_lio_self_check PUBLIC cxx_std_17)
   if(HAVE_LIVOX_SDK)
     target_link_libraries(lidar_mesh_composite_node ${LIVOX_SDK_LIB} pthread)
     # Livox vendors spdlog. Static-linking it into this executable exports
