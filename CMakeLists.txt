@@ -136,7 +136,19 @@ if(EXISTS "${UNITREE_SDK_LIB}")
   if(HAVE_LIVOX_SDK)
     list(APPEND LIDAR_MESH_SRCS src/livox_lidar_device.cpp)
   endif()
-  find_package(PCL REQUIRED COMPONENTS common filters)
+  find_package(PCL REQUIRED COMPONENTS common filters registration)
+  find_path(GTSAM_INCLUDE_DIRS gtsam/geometry/Pose3.h
+    HINTS /usr/local/include /usr/include)
+  find_library(GTSAM_LIB NAMES gtsam HINTS /usr/local/lib /usr/lib)
+  find_library(TBB_LIB NAMES tbb HINTS /usr/lib /usr/local/lib)
+  if(NOT GTSAM_LIB OR NOT GTSAM_INCLUDE_DIRS)
+    message(FATAL_ERROR
+      "GTSAM not found. In-process FAST-LIO loop closure needs libgtsam.")
+  endif()
+  set(LIO_SLAM_LIBS ${GTSAM_LIB})
+  if(TBB_LIB)
+    list(APPEND LIO_SLAM_LIBS ${TBB_LIB})
+  endif()
   find_package(OpenMP)
   set(FAST_LIO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../FAST_LIO")
   if(NOT EXISTS "${FAST_LIO_ROOT}/include/ikd-Tree/ikd_Tree.cpp")
@@ -146,6 +158,7 @@ if(EXISTS "${UNITREE_SDK_LIB}")
   endif()
   list(APPEND LIDAR_MESH_SRCS
     src/fast_lio_odometry.cpp
+    src/lio_slam.cpp
     ${FAST_LIO_ROOT}/include/ikd-Tree/ikd_Tree.cpp
   )
   add_executable(lidar_mesh_composite_node ${LIDAR_MESH_SRCS})
@@ -153,6 +166,7 @@ if(EXISTS "${UNITREE_SDK_LIB}")
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     ${UNITREE_SDK_ROOT}/include
     ${PCL_INCLUDE_DIRS}
+    ${GTSAM_INCLUDE_DIRS}
     ${FAST_LIO_ROOT}/include
     ${FAST_LIO_ROOT}/include/ikd-Tree
   )
@@ -171,6 +185,7 @@ if(EXISTS "${UNITREE_SDK_LIB}")
   target_link_libraries(lidar_mesh_composite_node
     ${UNITREE_SDK_LIB}
     ${PCL_LIBRARIES}
+    ${LIO_SLAM_LIBS}
     Eigen3::Eigen
     pthread
   )
@@ -184,16 +199,19 @@ if(EXISTS "${UNITREE_SDK_LIB}")
   add_executable(fast_lio_self_check
     src/fast_lio_self_check.cpp
     src/fast_lio_odometry.cpp
+    src/lio_slam.cpp
     ${FAST_LIO_ROOT}/include/ikd-Tree/ikd_Tree.cpp
   )
   target_include_directories(fast_lio_self_check PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${PCL_INCLUDE_DIRS}
+    ${GTSAM_INCLUDE_DIRS}
     ${FAST_LIO_ROOT}/include
     ${FAST_LIO_ROOT}/include/ikd-Tree
   )
   target_link_libraries(fast_lio_self_check
     ${PCL_LIBRARIES}
+    ${LIO_SLAM_LIBS}
     Eigen3::Eigen
     pthread
   )
@@ -201,6 +219,34 @@ if(EXISTS "${UNITREE_SDK_LIB}")
     target_link_libraries(fast_lio_self_check OpenMP::OpenMP_CXX)
   endif()
   target_compile_features(fast_lio_self_check PUBLIC cxx_std_17)
+  add_executable(fast_lio_replay
+    src/fast_lio_replay_node.cpp
+    src/fast_lio_odometry.cpp
+    src/lio_slam.cpp
+    ${FAST_LIO_ROOT}/include/ikd-Tree/ikd_Tree.cpp
+  )
+  target_include_directories(fast_lio_replay PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${PCL_INCLUDE_DIRS}
+    ${GTSAM_INCLUDE_DIRS}
+    ${FAST_LIO_ROOT}/include
+    ${FAST_LIO_ROOT}/include/ikd-Tree
+  )
+  ament_target_dependencies(fast_lio_replay
+    rclcpp
+    sensor_msgs
+    nav_msgs
+  )
+  target_link_libraries(fast_lio_replay
+    ${PCL_LIBRARIES}
+    ${LIO_SLAM_LIBS}
+    Eigen3::Eigen
+    pthread
+  )
+  if(OpenMP_CXX_FOUND)
+    target_link_libraries(fast_lio_replay OpenMP::OpenMP_CXX)
+  endif()
+  target_compile_features(fast_lio_replay PUBLIC cxx_std_17)
   if(HAVE_LIVOX_SDK)
     target_link_libraries(lidar_mesh_composite_node ${LIVOX_SDK_LIB} pthread)
     # Livox vendors spdlog. Static-linking it into this executable exports
@@ -212,6 +258,9 @@ if(EXISTS "${UNITREE_SDK_LIB}")
     endif()
   endif()
   target_compile_features(lidar_mesh_composite_node PUBLIC cxx_std_17)
+  set_target_properties(
+    lidar_mesh_composite_node fast_lio_replay fast_lio_self_check
+    PROPERTIES BUILD_RPATH "/usr/local/lib" INSTALL_RPATH "/usr/local/lib")
 else()
   message(WARNING
     "lidar_mesh_composite DISABLED (need unilidar_sdk static lib). "
@@ -314,7 +363,7 @@ install(TARGETS
   DESTINATION lib/${PROJECT_NAME}
 )
 if(BUILD_LIDAR_MESH_COMPOSITE)
-  install(TARGETS lidar_mesh_composite_node
+  install(TARGETS lidar_mesh_composite_node fast_lio_replay
     DESTINATION lib/${PROJECT_NAME}
   )
 endif()

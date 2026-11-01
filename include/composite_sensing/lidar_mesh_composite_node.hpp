@@ -12,6 +12,7 @@
 #include <Eigen/Geometry>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <nav_msgs/msg/path.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -20,6 +21,7 @@
 
 #include "composite_sensing/cloud_deskew.hpp"
 #include "composite_sensing/fast_lio_odometry.hpp"
+#include "composite_sensing/lio_slam.hpp"
 #include "composite_sensing/lidar_device.hpp"
 
 namespace composite_sensing
@@ -48,6 +50,7 @@ private:
     const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr & pub);
   void publish_temperatures();
   void emit_lio(const std::vector<FastLioScan> & scans);
+  void publish_slam_path();
   void on_odom(const nav_msgs::msg::Odometry::SharedPtr msg);
   std::vector<StampedOdomPose> snapshot_odom_poses(
     int64_t start_ns, int64_t end_ns);
@@ -107,6 +110,7 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::Temperature>::SharedPtr core_temp_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Temperature>::SharedPtr environment_temp_pub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr lio_odom_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr slam_path_pub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   std::unique_ptr<FastLioOdometry> fast_lio_;
 
@@ -124,6 +128,10 @@ private:
   bool cloud_stale_warned_{false};
   bool core_temp_high_warned_{false};
   bool lio_announced_{false};
+  bool slam_announced_{false};
+  std::mutex slam_mu_;
+  std::vector<SlamPose> slam_poses_;
+  std::unique_ptr<LioSlam> slam_;
 };
 
 }  // namespace composite_sensing

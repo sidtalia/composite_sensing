@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <deque>
+#include <random>
 
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/point_cloud.h>
@@ -322,7 +323,7 @@ struct LioCore
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
   explicit LioCore(const FastLioConfig & cfg)
-  : cfg(cfg), imu(cfg)
+  : cfg(cfg), imu(cfg), point_rng(cfg.point_noise_seed)
   {
     g_impl = this;
     down_surf.setLeafSize(cfg.filter_size_surf, cfg.filter_size_surf, cfg.filter_size_surf);
@@ -332,10 +333,9 @@ struct LioCore
     normvec.reset(new PointCloud(100000, 1));
     laser_cloud_ori.reset(new PointCloud(100000, 1));
     corr_norm.reset(new PointCloud(100000, 1));
-    std::fill(point_selected.begin(), point_selected.end(), true);
     double epsi[kPoseDof];
     std::fill(epsi, epsi + kPoseDof, 0.001);
-    kf.init_dyn_share(get_f, df_dx, df_dw, &Impl::h_share, cfg.max_iterations, epsi);
+    kf.init_dyn_share(get_f, df_dx, df_dw, &LioCore::h_share, cfg.max_iterations, epsi);
   }
 
   ~LioCore()
@@ -559,6 +559,9 @@ struct LioCore
     odom.position = v3(state.pos);
     odom.orientation = Eigen::Quaterniond(state.rot.toRotationMatrix()).normalized();
     odom.vel_body = odom.orientation.conjugate() * v3(state.vel);
+    lio_pose_twist_cov(
+      kf.get_P(), odom.orientation.toRotationMatrix(),
+      odom.pose_cov, odom.twist_cov);
     odom.valid = true;
     return odom;
   }
@@ -695,6 +698,7 @@ struct LioCore
 
   FastLioConfig cfg;
   ImuProcess imu;
+  std::mt19937 point_rng;
   esekfom::esekf<state_ikfom, 12, input_ikfom> kf;
   state_ikfom state;
   KD_TREE<PointType> ikdtree;
@@ -706,8 +710,8 @@ struct LioCore
   PointCloud::Ptr laser_cloud_ori;
   PointCloud::Ptr corr_norm;
   std::vector<PointVector> nearest;
-  std::vector<char> point_selected{100000, 1};
-  std::vector<float> res_last{100000, -1000.f};
+  std::vector<char> point_selected = std::vector<char>(100000, 1);
+  std::vector<float> res_last = std::vector<float>(100000, -1000.f);
   std::deque<ImuSample> imu_buf;
   std::deque<PendingScan> pending;
   BoxPointType local_map{};
@@ -774,6 +778,8 @@ std::vector<FastLioScan> FastLioOdometry::push_cloud(const LidarFrame & raw)
     pt.x = p.x;
     pt.y = p.y;
     pt.z = p.z;
+    add_lidar_point_noise(
+      pt.x, pt.y, pt.z, impl_->point_rng, impl_->cfg.point_noise_std_m);
     pt.intensity = p.intensity;
     pt.curvature = static_cast<float>(off * 1000.0);
     scan.cloud->push_back(pt);

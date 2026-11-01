@@ -223,9 +223,28 @@ void LidarMeshCompositeNode::start_pipeline()
     const Eigen::Isometry3d T_imu_lidar = T_lidar_imu.inverse();
     lio_cfg.lidar_T_wrt_imu = T_imu_lidar.translation();
     lio_cfg.lidar_R_wrt_imu = T_imu_lidar.linear();
+    lio_cfg.point_noise_std_m = static_cast<float>(
+      declare_parameter<double>("fast_lio.point_noise_std_m", 0.0));
+    lio_cfg.point_noise_seed = static_cast<uint32_t>(
+      declare_parameter<int>("fast_lio.point_noise_seed", 1));
     fast_lio_ = std::make_unique<FastLioOdometry>(lio_cfg);
+    if (lio_cfg.point_noise_std_m > 0.f) {
+      RCLCPP_WARN(
+        get_logger(), "lidar point noise on: N(0, %.4f m), seed %u",
+        lio_cfg.point_noise_std_m, lio_cfg.point_noise_seed);
+    }
     lio_odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(
       fast_lio_odom_topic_, 10);
+    slam_path_pub_ = create_publisher<nav_msgs::msg::Path>(
+      declare_parameter<std::string>(
+        "fast_lio.slam_path_topic", "/lidar_inertial/slam_path"),
+      10);
+    slam_ = std::make_unique<LioSlam>(
+      T_imu_lidar,
+      [this](const std::vector<SlamPose> & poses) {
+        std::lock_guard<std::mutex> lk(slam_mu_);
+        slam_poses_ = poses;
+      });
   }
 
   if (publish_cloud_) {
@@ -561,6 +580,9 @@ void LidarMeshCompositeNode::emit_lio(const std::vector<FastLioScan> & scans)
       points_published_ += scan.cloud.points.size();
       last_cloud_points_ = scan.cloud.points.size();
     }
+    if (slam_ && scan.odom.valid) {
+      slam_->push(scan.cloud, scan.odom);
+    }
     if (!scan.odom.valid || !lio_odom_pub_) {
       continue;
     }
@@ -578,7 +600,10 @@ void LidarMeshCompositeNode::emit_lio(const std::vector<FastLioScan> & scans)
     msg.twist.twist.linear.x = scan.odom.vel_body.x();
     msg.twist.twist.linear.y = scan.odom.vel_body.y();
     msg.twist.twist.linear.z = scan.odom.vel_body.z();
+    msg.pose.covariance = scan.odom.pose_cov;
+    msg.twist.covariance = scan.odom.twist_cov;
     lio_odom_pub_->publish(msg);
+    publish_slam_path();
     if (!lio_announced_) {
       RCLCPP_INFO(
         get_logger(), "fast-lio odom on %s (%s → %s)",
@@ -586,6 +611,43 @@ void LidarMeshCompositeNode::emit_lio(const std::vector<FastLioScan> & scans)
         imu_frame_.c_str());
       lio_announced_ = true;
     }
+  }
+}
+
+void LidarMeshCompositeNode::publish_slam_path()
+{
+  std::vector<SlamPose> poses;
+  {
+    std::lock_guard<std::mutex> lk(slam_mu_);
+    poses = slam_poses_;
+  }
+  if (poses.empty() || !slam_path_pub_) {
+    return;
+  }
+  nav_msgs::msg::Path path;
+  path.header.stamp = rclcpp::Time(poses.back().stamp_ns);
+  path.header.frame_id = fast_lio_odom_frame_;
+  path.poses.reserve(poses.size());
+  for (const auto & sp : poses) {
+    geometry_msgs::msg::PoseStamped ps;
+    ps.header = path.header;
+    const Eigen::Quaterniond q(sp.T_world_imu.rotation());
+    ps.pose.position.x = sp.T_world_imu.translation().x();
+    ps.pose.position.y = sp.T_world_imu.translation().y();
+    ps.pose.position.z = sp.T_world_imu.translation().z();
+    ps.pose.orientation.x = q.x();
+    ps.pose.orientation.y = q.y();
+    ps.pose.orientation.z = q.z();
+    ps.pose.orientation.w = q.w();
+    path.poses.push_back(ps);
+  }
+  slam_path_pub_->publish(path);
+  if (!slam_announced_) {
+    RCLCPP_INFO(
+      get_logger(), "fast-lio slam path on %s (%zu keyframes, frame %s)",
+      slam_path_pub_->get_topic_name(), poses.size(),
+      fast_lio_odom_frame_.c_str());
+    slam_announced_ = true;
   }
 }
 
